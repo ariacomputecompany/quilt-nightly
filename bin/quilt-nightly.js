@@ -11,6 +11,27 @@ const FALLBACK_CC_DOCKERFILE_URL =
   'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/main/cc/Dockerfile';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
+const ATTACH_HEARTBEAT_MS = 12_000;
+
+/**
+ * @typedef {Object} ApiRequestOptions
+ * @property {string} method
+ * @property {string} apiUrl
+ * @property {string} path
+ * @property {string | null} token
+ * @property {unknown} [body]
+ */
+
+/**
+ * @typedef {Error & {
+ *   status?: number | string,
+ *   requestId?: string | null,
+ *   code?: string | null,
+ *   payload?: unknown,
+ *   backendMessage?: string,
+ *   quiltNightlyLogged?: boolean
+ * }} NightlyError
+ */
 
 function parseDotEnv(content) {
   const parsed = {};
@@ -156,6 +177,39 @@ function authHeaders(token) {
   return { Authorization: `Bearer ${token}` };
 }
 
+function extractRequestId(headers) {
+  if (!headers || typeof headers.get !== 'function') return null;
+  return headers.get('x-request-id') || headers.get('X-Request-ID') || null;
+}
+
+function parseErrorBody(rawText) {
+  let json = null;
+  try {
+    json = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    json = null;
+  }
+
+  if (json && typeof json === 'object') {
+    return {
+      code: json.error_code || json.code || null,
+      message: json.error || json.message || rawText || 'unknown error',
+      requestId: json.request_id || null,
+      payload: json,
+    };
+  }
+
+  return {
+    code: null,
+    message: rawText || 'unknown error',
+    requestId: null,
+    payload: null,
+  };
+}
+
+/**
+ * @param {ApiRequestOptions} options
+ */
 async function apiRequest({ method, apiUrl, path: apiPath, token, body }) {
   const res = await fetch(`${apiUrl.replace(/\/$/, '')}${apiPath}`, {
     method,
@@ -167,16 +221,20 @@ async function apiRequest({ method, apiUrl, path: apiPath, token, body }) {
   });
 
   const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = { raw: text };
-  }
+  const parsed = parseErrorBody(text);
+  const json = parsed.payload || (text ? { raw: text } : null);
+  const requestId = extractRequestId(res.headers) || parsed.requestId;
 
   if (!res.ok) {
-    const msg = json?.error || json?.message || JSON.stringify(json) || text;
-    throw new Error(`${method} ${apiPath} failed (${res.status}): ${msg}`);
+    /** @type {NightlyError} */
+    const err = new Error(
+      `${method} ${apiPath} failed (${res.status}${requestId ? `, request_id=${requestId}` : ''}): ${parsed.message}`
+    );
+    err.status = res.status;
+    err.requestId = requestId;
+    err.code = parsed.code;
+    err.payload = parsed.payload;
+    throw err;
   }
 
   return json;
@@ -236,10 +294,20 @@ async function deleteContainer(apiUrl, token, containerId) {
     });
     process.stderr.write(`\n[quilt-nightly] cleaned up container ${containerId}\n`);
   } catch (e) {
-    process.stderr.write(`\n[quilt-nightly] cleanup failed for ${containerId}: ${e.message}\n`);
+    process.stderr.write(`\n[quilt-nightly] cleanup failed: ${e.message}\n`);
   }
 }
 
+/**
+ * @param {{
+ *   apiUrl: string,
+ *   token: string | null,
+ *   containerId: string,
+ *   cols: number,
+ *   rows: number,
+ *   claudePath: string
+ * }} options
+ */
 function attachClaude({ apiUrl, token, containerId, cols, rows, claudePath }) {
   return new Promise((resolve, reject) => {
     const wsBase = toWsBase(apiUrl).replace(/\/$/, '');
@@ -256,6 +324,8 @@ function attachClaude({ apiUrl, token, containerId, cols, rows, claudePath }) {
 
     let settled = false;
     let rawEnabled = false;
+    let ready = false;
+    let heartbeat = null;
     const stdin = process.stdin;
 
     const onResize = () => {
@@ -279,9 +349,14 @@ function attachClaude({ apiUrl, token, containerId, cols, rows, claudePath }) {
       stdin.off('data', onData);
       if (rawEnabled && stdin.isTTY) stdin.setRawMode(false);
       stdin.pause();
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
     };
 
     ws.on('open', () => {
+      process.stderr.write('[quilt-nightly] terminal session connected\n');
       if (stdin.isTTY) {
         stdin.setRawMode(true);
         rawEnabled = true;
@@ -290,11 +365,21 @@ function attachClaude({ apiUrl, token, containerId, cols, rows, claudePath }) {
       stdin.on('data', onData);
       process.stdout.on('resize', onResize);
       onResize();
+
+      heartbeat = setInterval(() => {
+        if (!ready) {
+          process.stderr.write('[quilt-nightly] waiting for terminal readiness...\n');
+        }
+      }, ATTACH_HEARTBEAT_MS);
     });
 
     ws.on('message', (data, isBinary) => {
       if (isBinary) {
-        process.stdout.write(data);
+        ready = true;
+        const output = Array.isArray(data)
+          ? Buffer.concat(data.map((chunk) => Buffer.from(/** @type {any} */ (chunk))))
+          : Buffer.from(/** @type {any} */ (data));
+        process.stdout.write(output);
         return;
       }
 
@@ -310,12 +395,38 @@ function attachClaude({ apiUrl, token, containerId, cols, rows, claudePath }) {
         settled = true;
         ws.close();
         reject(new Error(`${msg.code || 'ERROR'}: ${msg.message || 'unknown websocket error'}`));
+      } else if (msg.type === 'ready') {
+        ready = true;
       } else if (msg.type === 'exit') {
         cleanupIO();
         settled = true;
         ws.close();
         resolve(msg.code ?? 0);
       }
+    });
+
+    ws.on('unexpected-response', (_request, response) => {
+      const status = response?.statusCode || 0;
+      const requestId = response?.headers?.['x-request-id'] || response?.headers?.['X-Request-ID'];
+      let body = '';
+      response.on('data', (chunk) => {
+        body += chunk.toString('utf8');
+      });
+      response.on('end', () => {
+        cleanupIO();
+        settled = true;
+        const parsed = parseErrorBody(body);
+        const finalRequestId = requestId || parsed.requestId || 'unknown';
+        /** @type {NightlyError} */
+        const err = new Error(
+          `terminal attach failed (status=${status}, code=${parsed.code || 'ERROR'}, request_id=${finalRequestId}): ${parsed.message}`
+        );
+        err.status = status;
+        err.code = parsed.code || 'ERROR';
+        err.requestId = finalRequestId;
+        err.backendMessage = parsed.message;
+        reject(err);
+      });
     });
 
     ws.on('close', () => {
@@ -370,6 +481,20 @@ function validateArgs(args) {
   }
 }
 
+/**
+ * @param {{
+ *   name: string | null,
+ *   apiUrl: string,
+ *   image: string,
+ *   token: string | null,
+ *   claudePath: string,
+ *   startTimeoutMs: number,
+ *   cols: number | null,
+ *   rows: number | null,
+ *   cleanup: boolean,
+ *   keep: boolean
+ * }} args
+ */
 async function runCcFlow(args) {
   const name = args.name || randomName();
   process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
@@ -416,6 +541,12 @@ async function runCcFlow(args) {
     const size = terminalSize();
     const cols = Number.isFinite(args.cols) && args.cols > 0 ? args.cols : size.cols;
     const rows = Number.isFinite(args.rows) && args.rows > 0 ? args.rows : size.rows;
+    process.stderr.write(
+      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${args.claudePath})\n`
+    );
+    process.stderr.write(
+      `[quilt-nightly] terminal attach can take up to ~${Math.ceil(args.startTimeoutMs / 1000)} seconds\n`
+    );
 
     const exitCode = await attachClaude({
       apiUrl: args.apiUrl,
@@ -428,6 +559,16 @@ async function runCcFlow(args) {
 
     await maybeCleanup();
     process.exitCode = typeof exitCode === 'number' ? exitCode : 0;
+  } catch (err) {
+    /** @type {NightlyError} */
+    const nightlyErr = /** @type {NightlyError} */ (err);
+    if (nightlyErr?.status || nightlyErr?.requestId || nightlyErr?.code) {
+      process.stderr.write(
+        `[quilt-nightly] terminal attach failed (status=${nightlyErr.status || 'unknown'}, code=${nightlyErr.code || 'ERROR'}, request_id=${nightlyErr.requestId || 'unknown'}): ${nightlyErr.backendMessage || nightlyErr.message}\n`
+      );
+      nightlyErr.quiltNightlyLogged = true;
+    }
+    throw nightlyErr;
   } finally {
     process.off('SIGINT', sigHandler);
     process.off('SIGTERM', sigHandler);
@@ -447,7 +588,11 @@ async function main() {
     validateArgs(args);
     await runCcFlow(args);
   } catch (err) {
-    process.stderr.write(`[quilt-nightly] error: ${err.message}\n`);
+    /** @type {NightlyError} */
+    const nightlyErr = /** @type {NightlyError} */ (err);
+    if (!nightlyErr?.quiltNightlyLogged) {
+      process.stderr.write(`[quilt-nightly] error: ${nightlyErr.message}\n`);
+    }
     process.exit(1);
   }
 }

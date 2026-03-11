@@ -1,6 +1,6 @@
 {
   "name": "quilt-nightly",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "experimental developer images for the quilt runtime",
   "type": "module",
   "bin": {
@@ -17,7 +17,8 @@
   ],
   "scripts": {
     "start": "node bin/quilt-nightly.js",
-    "lint": "node --check bin/quilt-nightly.js"
+    "lint": "node --check bin/quilt-nightly.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [
     "quilt",
@@ -29,5 +30,10 @@
   "license": "MIT",
   "dependencies": {
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.4.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
   }
 }
