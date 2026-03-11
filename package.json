@@ -1,0 +1,33 @@
+{
+  "name": "quilt-nightly",
+  "version": "0.2.2",
+  "description": "experimental developer images for the quilt runtime",
+  "type": "module",
+  "bin": {
+    "quilt-nightly": "bin/quilt-nightly.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "cc",
+    "README.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "start": "node bin/quilt-nightly.js",
+    "lint": "node --check bin/quilt-nightly.js"
+  },
+  "keywords": [
+    "quilt",
+    "nightly",
+    "claude",
+    "containers",
+    "developer-tools"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
