@@ -6,7 +6,7 @@ import process from 'node:process';
 import WebSocket from 'ws';
 
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
-const FALLBACK_CLAUDE_PATH = '/usr/local/bin/claude';
+const FALLBACK_CLAUDE_PATH = '/usr/bin/claude';
 const FALLBACK_CC_DOCKERFILE_URL =
   'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/main/cc/Dockerfile';
 const DEFAULT_START_TIMEOUT_MS = 60_000;

@@ -11,7 +11,12 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     --fetch-retry-factor=2 \
     --fetch-retry-mintimeout=2000 \
     --fetch-retry-maxtimeout=120000 \
-    && command -v claude >/dev/null \
+    && CLAUDE_BIN="$(command -v claude)" \
+    && [ -n "${CLAUDE_BIN}" ] \
+    && ln -sf "${CLAUDE_BIN}" /usr/local/bin/claude \
+    && ln -sf "${CLAUDE_BIN}" /usr/bin/claude \
+    && /usr/local/bin/claude --version >/dev/null \
+    && /usr/bin/claude --version >/dev/null \
     && claude --version >/dev/null
 
 WORKDIR /workspace
