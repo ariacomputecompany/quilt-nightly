@@ -83,7 +83,8 @@ function defaults() {
   return {
     apiUrl: process.env.QUILT_API_URL || FALLBACK_API_URL,
     image: process.env.QUILT_NIGHTLY_CC_IMAGE || FALLBACK_CC_DOCKERFILE_URL,
-    token: process.env.QUILT_TOKEN || process.env.QUILT_API_KEY || null,
+    // Match quilt.sh auto auth precedence: API key first, then bearer token.
+    token: process.env.QUILT_API_KEY || process.env.QUILT_TOKEN || null,
     claudePath: process.env.QUILT_NIGHTLY_CLAUDE_PATH || FALLBACK_CLAUDE_PATH,
     startTimeoutMs: Number(process.env.QUILT_NIGHTLY_START_TIMEOUT_MS) || DEFAULT_START_TIMEOUT_MS,
   };
