@@ -6,7 +6,6 @@ import process from 'node:process';
 import WebSocket from 'ws';
 
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
-const FALLBACK_CLAUDE_PATH = '/usr/bin/claude';
 const FALLBACK_CC_DOCKERFILE_URL =
   'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/main/cc/Dockerfile';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
@@ -106,7 +105,7 @@ function defaults() {
     image: process.env.QUILT_NIGHTLY_CC_IMAGE || FALLBACK_CC_DOCKERFILE_URL,
     // Match quilt.sh auto auth precedence: API key first, then bearer token.
     token: process.env.QUILT_API_KEY || process.env.QUILT_TOKEN || null,
-    claudePath: process.env.QUILT_NIGHTLY_CLAUDE_PATH || FALLBACK_CLAUDE_PATH,
+    claudePath: process.env.QUILT_NIGHTLY_CLAUDE_PATH || '',
     startTimeoutMs: Number(process.env.QUILT_NIGHTLY_START_TIMEOUT_MS) || DEFAULT_START_TIMEOUT_MS,
   };
 }
@@ -126,7 +125,7 @@ Options:
 Automatic defaults (no flags needed):
   api_url=${d.apiUrl}
   image=${d.image || '(empty -> server auto Dockerfile lookup)'}
-  claude_path=${d.claudePath}
+  claude_path=${d.claudePath || '(auto-resolve in container)'}
 `);
 }
 
@@ -325,6 +324,43 @@ async function deleteContainer(apiUrl, token, containerId) {
   }
 }
 
+async function resolveClaudePath(apiUrl, token, containerId, preferredPath) {
+  const preferred = String(preferredPath || '').trim();
+  if (preferred) return preferred;
+
+  const command = [
+    'if [ -x /usr/local/bin/claude ]; then echo /usr/local/bin/claude;',
+    'elif [ -x /usr/bin/claude ]; then echo /usr/bin/claude;',
+    'elif command -v claude >/dev/null 2>&1; then command -v claude;',
+    'else exit 127; fi',
+  ].join(' ');
+
+  const data = await apiRequest({
+    method: 'POST',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/exec`,
+    token,
+    body: {
+      command,
+      capture_output: true,
+      detach: false,
+      timeout_ms: 20_000,
+    },
+  });
+
+  const exitCode = Number(data?.exit_code ?? -1);
+  const stdout = String(data?.stdout || '')
+    .trim()
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .find((s) => s);
+
+  if (exitCode !== 0 || !stdout || !stdout.startsWith('/')) {
+    throw new Error('Unable to resolve Claude binary path via container exec');
+  }
+  return stdout;
+}
+
 /**
  * @param {{
  *   apiUrl: string,
@@ -487,10 +523,6 @@ function validateArgs(args) {
     throw new Error(`--api-url must use http:// or https:// (got ${parsed.protocol})`);
   }
 
-  if (!args.claudePath || !args.claudePath.trim()) {
-    throw new Error('--claude-path must be non-empty');
-  }
-
   if (!Number.isFinite(args.startTimeoutMs) || args.startTimeoutMs < 1000) {
     throw new Error('--start-timeout-ms must be >= 1000');
   }
@@ -568,12 +600,19 @@ async function runCcFlow(args) {
   try {
     await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
     process.stderr.write('[quilt-nightly] container running; launching Claude TUI...\n');
+    process.stderr.write('[quilt-nightly] resolving Claude executable path via API exec...\n');
+    const resolvedClaudePath = await resolveClaudePath(
+      args.apiUrl,
+      args.token,
+      containerId,
+      args.claudePath
+    );
 
     const size = terminalSize();
     const cols = Number.isFinite(args.cols) && args.cols > 0 ? args.cols : size.cols;
     const rows = Number.isFinite(args.rows) && args.rows > 0 ? args.rows : size.rows;
     process.stderr.write(
-      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${args.claudePath})\n`
+      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${resolvedClaudePath})\n`
     );
     process.stderr.write(
       `[quilt-nightly] terminal attach can take up to ~${Math.ceil(args.startTimeoutMs / 1000)} seconds\n`
@@ -585,7 +624,7 @@ async function runCcFlow(args) {
       containerId,
       cols,
       rows,
-      claudePath: args.claudePath,
+      claudePath: resolvedClaudePath,
     });
 
     await maybeCleanup();
