@@ -207,6 +207,31 @@ function parseErrorBody(rawText) {
   };
 }
 
+function summarizeBackendMessage(rawMessage) {
+  const message = String(rawMessage || '').trim();
+  if (!message) return 'request failed';
+  const lower = message.toLowerCase();
+  if (lower.includes('docker build failed')) {
+    return 'container image build failed';
+  }
+  if (lower.includes('timed out')) {
+    return 'operation timed out';
+  }
+  const singleLine = message.split('\n')[0].trim();
+  return singleLine || 'request failed';
+}
+
+async function withHeartbeat(promise, message, intervalMs = 12_000) {
+  const timer = setInterval(() => {
+    process.stderr.write(`${message}\n`);
+  }, intervalMs);
+  try {
+    return await promise;
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 /**
  * @param {ApiRequestOptions} options
  */
@@ -226,14 +251,16 @@ async function apiRequest({ method, apiUrl, path: apiPath, token, body }) {
   const requestId = extractRequestId(res.headers) || parsed.requestId;
 
   if (!res.ok) {
+    const summary = summarizeBackendMessage(parsed.message);
     /** @type {NightlyError} */
     const err = new Error(
-      `${method} ${apiPath} failed (${res.status}${requestId ? `, request_id=${requestId}` : ''}): ${parsed.message}`
+      `${method} ${apiPath} failed (${res.status}${requestId ? `, request_id=${requestId}` : ''}): ${summary}`
     );
     err.status = res.status;
     err.requestId = requestId;
     err.code = parsed.code;
     err.payload = parsed.payload;
+    err.backendMessage = summary;
     throw err;
   }
 
@@ -498,20 +525,24 @@ function validateArgs(args) {
 async function runCcFlow(args) {
   const name = args.name || randomName();
   process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
+  process.stderr.write('[quilt-nightly] preparing runtime image (this can take a little while)\n');
 
-  const created = await apiRequest({
-    method: 'POST',
-    apiUrl: args.apiUrl,
-    path: '/api/containers?execution=sync',
-    token: args.token,
-    body: {
-      name,
-      image: args.image || '',
-      oci: true,
-      command: ['tail', '-f', '/dev/null'],
-      strict: true,
-    },
-  });
+  const created = await withHeartbeat(
+    apiRequest({
+      method: 'POST',
+      apiUrl: args.apiUrl,
+      path: '/api/containers?execution=sync',
+      token: args.token,
+      body: {
+        name,
+        image: args.image || '',
+        oci: true,
+        command: ['tail', '-f', '/dev/null'],
+        strict: true,
+      },
+    }),
+    '[quilt-nightly] pulling/building image...'
+  );
 
   const containerId = created?.container_id;
   if (!containerId) throw new Error('API did not return container_id');
@@ -564,7 +595,7 @@ async function runCcFlow(args) {
     const nightlyErr = /** @type {NightlyError} */ (err);
     if (nightlyErr?.status || nightlyErr?.requestId || nightlyErr?.code) {
       process.stderr.write(
-        `[quilt-nightly] terminal attach failed (status=${nightlyErr.status || 'unknown'}, code=${nightlyErr.code || 'ERROR'}, request_id=${nightlyErr.requestId || 'unknown'}): ${nightlyErr.backendMessage || nightlyErr.message}\n`
+        `[quilt-nightly] operation failed (status=${nightlyErr.status || 'unknown'}, code=${nightlyErr.code || 'ERROR'}, request_id=${nightlyErr.requestId || 'unknown'}): ${nightlyErr.backendMessage || nightlyErr.message}\n`
       );
       nightlyErr.quiltNightlyLogged = true;
     }

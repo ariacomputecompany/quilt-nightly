@@ -13,8 +13,10 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     --fetch-retry-maxtimeout=120000 \
     && CLAUDE_BIN="$(command -v claude)" \
     && [ -n "${CLAUDE_BIN}" ] \
-    && ln -sf "${CLAUDE_BIN}" /usr/local/bin/claude \
-    && ln -sf "${CLAUDE_BIN}" /usr/bin/claude \
+    && CLAUDE_REAL="$(readlink -f "${CLAUDE_BIN}")" \
+    && [ -x "${CLAUDE_REAL}" ] \
+    && if [ "${CLAUDE_REAL}" != "/usr/local/bin/claude" ]; then ln -sf "${CLAUDE_REAL}" /usr/local/bin/claude; fi \
+    && if [ "${CLAUDE_REAL}" != "/usr/bin/claude" ]; then ln -sf "${CLAUDE_REAL}" /usr/bin/claude; fi \
     && /usr/local/bin/claude --version >/dev/null \
     && /usr/bin/claude --version >/dev/null \
     && claude --version >/dev/null
