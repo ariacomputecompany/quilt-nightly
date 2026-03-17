@@ -5,6 +5,7 @@
 It includes:
 - Node.js + npm
 - global `codex` binary from `@openai/codex`
+- common shell tooling (`bash`, `curl`, `git`, `ssh` client)
 
 ## Build
 

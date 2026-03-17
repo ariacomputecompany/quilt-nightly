@@ -7,9 +7,9 @@ import WebSocket from 'ws';
 
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
 const FALLBACK_CC_DOCKERFILE_URL =
-  'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/main/cc/Dockerfile';
+  'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/master/cc/Dockerfile';
 const FALLBACK_CODEX_DOCKERFILE_URL =
-  'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/main/codex/Dockerfile';
+  'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/master/codex/Dockerfile';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
 const ATTACH_HEARTBEAT_MS = 12_000;
