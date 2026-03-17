@@ -8,9 +8,32 @@ import WebSocket from 'ws';
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
 const FALLBACK_CC_DOCKERFILE_URL =
   'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/main/cc/Dockerfile';
+const FALLBACK_CODEX_DOCKERFILE_URL =
+  'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/main/codex/Dockerfile';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
 const ATTACH_HEARTBEAT_MS = 12_000;
+const PROFILE_CC = {
+  key: 'cc',
+  flag: '--cc',
+  displayName: 'Claude Code',
+  executable: 'claude',
+  fallbackImage: FALLBACK_CC_DOCKERFILE_URL,
+  envImage: 'QUILT_NIGHTLY_CC_IMAGE',
+  envPath: 'QUILT_NIGHTLY_CLAUDE_PATH',
+  fallbackPathCandidates: ['/usr/local/bin/claude', '/usr/bin/claude'],
+};
+const PROFILE_CODEX = {
+  key: 'codex',
+  flag: '--codex',
+  displayName: 'Codex',
+  executable: 'codex',
+  fallbackImage: FALLBACK_CODEX_DOCKERFILE_URL,
+  envImage: 'QUILT_NIGHTLY_CODEX_IMAGE',
+  envPath: 'QUILT_NIGHTLY_CODEX_PATH',
+  fallbackPathCandidates: ['/usr/local/bin/codex', '/usr/bin/codex'],
+};
+const PROFILES = [PROFILE_CC, PROFILE_CODEX];
 
 /**
  * @typedef {Object} ApiRequestOptions
@@ -102,10 +125,8 @@ function loadLocalEnv(argv) {
 function defaults() {
   return {
     apiUrl: process.env.QUILT_API_URL || FALLBACK_API_URL,
-    image: process.env.QUILT_NIGHTLY_CC_IMAGE || FALLBACK_CC_DOCKERFILE_URL,
     // Match quilt.sh auto auth precedence: API key first, then bearer token.
     token: process.env.QUILT_API_KEY || process.env.QUILT_TOKEN || null,
-    claudePath: process.env.QUILT_NIGHTLY_CLAUDE_PATH || '',
     startTimeoutMs: Number(process.env.QUILT_NIGHTLY_START_TIMEOUT_MS) || DEFAULT_START_TIMEOUT_MS,
   };
 }
@@ -115,17 +136,21 @@ function usage(d) {
 
 Usage:
   npx quilt-nightly --cc [options]
+  npx quilt-nightly --codex [options]
 
 Options:
   --cc                     Launch a Claude Code container flow via API
+  --codex                  Launch a Codex container flow via API
   --name <name>            Container name (default: auto-generated)
   --keep                   Keep container after terminal exits
   --help                   Show this help
 
 Automatic defaults (no flags needed):
   api_url=${d.apiUrl}
-  image=${d.image || '(empty -> server auto Dockerfile lookup)'}
-  claude_path=${d.claudePath || '(auto-resolve in container)'}
+  cc_image=${process.env.QUILT_NIGHTLY_CC_IMAGE || FALLBACK_CC_DOCKERFILE_URL}
+  codex_image=${process.env.QUILT_NIGHTLY_CODEX_IMAGE || FALLBACK_CODEX_DOCKERFILE_URL}
+  claude_path=${process.env.QUILT_NIGHTLY_CLAUDE_PATH || '(auto-resolve in container)'}
+  codex_path=${process.env.QUILT_NIGHTLY_CODEX_PATH || '(auto-resolve in container)'}
 `);
 }
 
@@ -133,11 +158,13 @@ function parseArgs(argv) {
   const d = defaults();
   const args = {
     cc: false,
+    codex: false,
+    profile: null,
     apiUrl: d.apiUrl,
-    image: d.image,
+    image: '',
     name: null,
     token: d.token,
-    claudePath: d.claudePath,
+    toolPath: '',
     startTimeoutMs: d.startTimeoutMs,
     keep: false,
     cleanup: true,
@@ -151,6 +178,7 @@ function parseArgs(argv) {
   for (let i = 2; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--cc') args.cc = true;
+    else if (a === '--codex') args.codex = true;
     else if (a === '--help' || a === '-h') args.help = true;
     else if (a === '--name') args.name = argv[++i];
     else if (a === '--keep') {
@@ -159,6 +187,17 @@ function parseArgs(argv) {
     } else {
       throw new Error(`Unknown argument: ${a}`);
     }
+  }
+
+  if (args.cc && args.codex) {
+    throw new Error('Choose only one profile flag: --cc or --codex');
+  }
+  if (args.cc) args.profile = PROFILE_CC;
+  if (args.codex) args.profile = PROFILE_CODEX;
+
+  if (args.profile) {
+    args.image = process.env[args.profile.envImage] || args.profile.fallbackImage;
+    args.toolPath = process.env[args.profile.envPath] || '';
   }
 
   return args;
@@ -324,14 +363,15 @@ async function deleteContainer(apiUrl, token, containerId) {
   }
 }
 
-async function resolveClaudePath(apiUrl, token, containerId, preferredPath) {
+async function resolveToolPath(apiUrl, token, containerId, preferredPath, profile) {
   const preferred = String(preferredPath || '').trim();
   if (preferred) return preferred;
 
+  const [firstCandidate, secondCandidate] = profile.fallbackPathCandidates;
   const command = [
-    'if [ -x /usr/local/bin/claude ]; then echo /usr/local/bin/claude;',
-    'elif [ -x /usr/bin/claude ]; then echo /usr/bin/claude;',
-    'elif command -v claude >/dev/null 2>&1; then command -v claude;',
+    `if [ -x ${firstCandidate} ]; then echo ${firstCandidate};`,
+    `elif [ -x ${secondCandidate} ]; then echo ${secondCandidate};`,
+    `elif command -v ${profile.executable} >/dev/null 2>&1; then command -v ${profile.executable};`,
     'else exit 127; fi',
   ].join(' ');
 
@@ -356,7 +396,7 @@ async function resolveClaudePath(apiUrl, token, containerId, preferredPath) {
     .find((s) => s);
 
   if (exitCode !== 0 || !stdout || !stdout.startsWith('/')) {
-    throw new Error('Unable to resolve Claude binary path via container exec');
+    throw new Error(`Unable to resolve ${profile.displayName} binary path via container exec`);
   }
   return stdout;
 }
@@ -368,17 +408,17 @@ async function resolveClaudePath(apiUrl, token, containerId, preferredPath) {
  *   containerId: string,
  *   cols: number,
  *   rows: number,
- *   claudePath: string
+ *   toolPath: string
  * }} options
  */
-function attachClaude({ apiUrl, token, containerId, cols, rows, claudePath }) {
+function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
   return new Promise((resolve, reject) => {
     const wsBase = toWsBase(apiUrl).replace(/\/$/, '');
     const params = new URLSearchParams({
       container_id: containerId,
       cols: String(cols),
       rows: String(rows),
-      shell: claudePath,
+      shell: toolPath,
     });
     if (token) params.set('token', token);
 
@@ -507,8 +547,8 @@ function attachClaude({ apiUrl, token, containerId, cols, rows, claudePath }) {
   });
 }
 
-function randomName() {
-  return `nightly-cc-${Date.now().toString(36)}`;
+function randomName(profile) {
+  return `nightly-${profile.key}-${Date.now().toString(36)}`;
 }
 
 function validateArgs(args) {
@@ -546,7 +586,8 @@ function validateArgs(args) {
  *   apiUrl: string,
  *   image: string,
  *   token: string | null,
- *   claudePath: string,
+ *   toolPath: string,
+ *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX,
  *   startTimeoutMs: number,
  *   cols: number | null,
  *   rows: number | null,
@@ -554,8 +595,9 @@ function validateArgs(args) {
  *   keep: boolean
  * }} args
  */
-async function runCcFlow(args) {
-  const name = args.name || randomName();
+async function runProfileFlow(args) {
+  const profile = args.profile;
+  const name = args.name || randomName(profile);
   process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
   process.stderr.write('[quilt-nightly] preparing runtime image (this can take a little while)\n');
 
@@ -599,32 +641,37 @@ async function runCcFlow(args) {
 
   try {
     await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
-    process.stderr.write('[quilt-nightly] container running; launching Claude TUI...\n');
-    process.stderr.write('[quilt-nightly] resolving Claude executable path via API exec...\n');
-    const resolvedClaudePath = await resolveClaudePath(
+    process.stderr.write(
+      `[quilt-nightly] container running; launching ${profile.displayName} TUI...\n`
+    );
+    process.stderr.write(
+      `[quilt-nightly] resolving ${profile.displayName} executable path via API exec...\n`
+    );
+    const resolvedToolPath = await resolveToolPath(
       args.apiUrl,
       args.token,
       containerId,
-      args.claudePath
+      args.toolPath,
+      profile
     );
 
     const size = terminalSize();
     const cols = Number.isFinite(args.cols) && args.cols > 0 ? args.cols : size.cols;
     const rows = Number.isFinite(args.rows) && args.rows > 0 ? args.rows : size.rows;
     process.stderr.write(
-      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${resolvedClaudePath})\n`
+      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${resolvedToolPath})\n`
     );
     process.stderr.write(
       `[quilt-nightly] terminal attach can take up to ~${Math.ceil(args.startTimeoutMs / 1000)} seconds\n`
     );
 
-    const exitCode = await attachClaude({
+    const exitCode = await attachTool({
       apiUrl: args.apiUrl,
       token: args.token,
       containerId,
       cols,
       rows,
-      claudePath: resolvedClaudePath,
+      toolPath: resolvedToolPath,
     });
 
     await maybeCleanup();
@@ -650,13 +697,13 @@ async function main() {
     loadLocalEnv(process.argv);
     const args = parseArgs(process.argv);
 
-    if (args.help || !args.cc) {
+    if (args.help || !args.profile) {
       usage(defaults());
       process.exit(args.help ? 0 : 1);
     }
 
     validateArgs(args);
-    await runCcFlow(args);
+    await runProfileFlow(args);
   } catch (err) {
     /** @type {NightlyError} */
     const nightlyErr = /** @type {NightlyError} */ (err);

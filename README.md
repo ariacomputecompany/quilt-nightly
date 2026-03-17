@@ -4,19 +4,22 @@ Experimental launchers for Quilt Nightly workflows.
 
 ## Production Default
 
-`npx quilt-nightly --cc` is the primary command.
+`npx quilt-nightly --cc` and `npx quilt-nightly --codex` are supported.
 
 It automatically uses:
 - `QUILT_API_URL` from env, defaulting to `https://backend.quilt.sh`
 - `QUILT_API_KEY` first, then `QUILT_TOKEN`, from env for auth
-- canonical raw `cc/Dockerfile` URL as the `oci=true` image target
-- Claude binary path auto-resolved in-container via `/api/containers/:id/exec`
-  (optional override with `QUILT_NIGHTLY_CLAUDE_PATH`)
+- canonical raw profile Dockerfile URL as the `oci=true` image target:
+  - `cc/Dockerfile` for `--cc`
+  - `codex/Dockerfile` for `--codex`
+- tool binary path auto-resolved in-container via `/api/containers/:id/exec`
+  (optional overrides: `QUILT_NIGHTLY_CLAUDE_PATH`, `QUILT_NIGHTLY_CODEX_PATH`)
 
 ## Quick Start
 
 ```bash
 npx quilt-nightly --cc
+npx quilt-nightly --codex
 ```
 
 ## Environment Loading
@@ -31,5 +34,5 @@ Use `.env.example` as template.
 ## Notes
 
 - Authentication is not embedded in the image.
-- Users authenticate inside Claude Code after TUI opens.
+- Users authenticate inside the selected tool after TUI opens.
 - Interactive terminal (TTY) is required.

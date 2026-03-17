@@ -12,6 +12,7 @@
   "files": [
     "bin",
     "cc",
+    "codex",
     "README.md",
     ".env.example"
   ],
@@ -24,6 +25,7 @@
     "quilt",
     "nightly",
     "claude",
+    "codex",
     "containers",
     "developer-tools"
   ],
