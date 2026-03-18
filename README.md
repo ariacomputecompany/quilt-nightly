@@ -9,6 +9,7 @@ Experimental launchers for Quilt Nightly workflows.
 It automatically uses:
 - `QUILT_API_URL` from env, defaulting to `https://backend.quilt.sh`
 - `QUILT_API_KEY` first, then `QUILT_TOKEN`, from env for auth
+  - if neither is set, CLI prompts: `Enter your api key:`
 - canonical raw profile Dockerfile URL as the `oci=true` image target:
   - `cc/Dockerfile` for `--cc`
   - `codex/Dockerfile` for `--codex`

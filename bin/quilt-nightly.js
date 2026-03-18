@@ -3,6 +3,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { Writable } from 'node:stream';
+import { createInterface } from 'node:readline/promises';
 import WebSocket from 'ws';
 
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
@@ -201,6 +203,54 @@ function parseArgs(argv) {
   }
 
   return args;
+}
+
+class MutedOutput extends Writable {
+  constructor(delegate) {
+    super();
+    this.delegate = delegate;
+    this.muted = false;
+  }
+
+  _write(chunk, encoding, callback) {
+    if (!this.muted) {
+      this.delegate.write(chunk, encoding);
+    }
+    callback();
+  }
+}
+
+async function ensureApiToken(args) {
+  if (args.token) return;
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(
+      'No API key found. Set QUILT_API_KEY or QUILT_TOKEN, or run interactively to enter one.'
+    );
+  }
+
+  const output = new MutedOutput(process.stderr);
+  const rl = createInterface({
+    input: process.stdin,
+    output,
+    terminal: true,
+  });
+
+  try {
+    process.stderr.write('[quilt-nightly] Enter your Quilt API Key: ');
+    output.muted = true;
+    const answer = await rl.question('');
+    output.muted = false;
+    process.stderr.write('\n');
+
+    const token = String(answer || '').trim();
+    if (!token) {
+      throw new Error('API key is required.');
+    }
+    args.token = token;
+  } finally {
+    rl.close();
+  }
 }
 
 function toWsBase(apiUrl) {
@@ -703,6 +753,7 @@ async function main() {
     }
 
     validateArgs(args);
+    await ensureApiToken(args);
     await runProfileFlow(args);
   } catch (err) {
     /** @type {NightlyError} */
