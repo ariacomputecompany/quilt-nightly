@@ -141,7 +141,7 @@ Usage:
 Options:
   --cc                     Launch a Claude Code container flow via API
   --codex                  Launch a Codex container flow via API
-  --name <name>            Container name (default: auto-generated)
+  --name <name>            Container name; reuses/resumes existing name if present
   --keep                   Keep container after terminal exits
   --help                   Show this help
 
@@ -372,12 +372,21 @@ async function waitForRunning(apiUrl, token, containerId, timeoutMs) {
     if (state === 'running') return;
     if ((state === 'created' || state === 'stopped') && !startAttempted) {
       startAttempted = true;
-      await apiRequest({
-        method: 'POST',
-        apiUrl,
-        path: `/api/containers/${encodeURIComponent(containerId)}/start`,
-        token,
-      });
+      try {
+        await apiRequest({
+          method: 'POST',
+          apiUrl,
+          path: `/api/containers/${encodeURIComponent(containerId)}/resume?execution=sync`,
+          token,
+        });
+      } catch (_resumeErr) {
+        await apiRequest({
+          method: 'POST',
+          apiUrl,
+          path: `/api/containers/${encodeURIComponent(containerId)}/start`,
+          token,
+        });
+      }
       await sleep(750);
       continue;
     }
@@ -409,6 +418,15 @@ async function deleteContainer(apiUrl, token, containerId) {
   } catch (e) {
     process.stderr.write(`\n[quilt-nightly] cleanup failed: ${e.message}\n`);
   }
+}
+
+async function resolveContainerByName(apiUrl, token, name) {
+  return apiRequest({
+    method: 'GET',
+    apiUrl,
+    path: `/api/containers/by-name/${encodeURIComponent(name)}`,
+    token,
+  });
 }
 
 /**
@@ -631,36 +649,55 @@ async function runProfileFlow(args) {
     '[quilt-nightly] pulling OCI image metadata/layers...'
   );
 
-  process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
-  process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
+  let createdNew = false;
+  let containerId = '';
+  let containerIdentifier = name;
 
-  const created = await withHeartbeat(
-    apiRequest({
-      method: 'POST',
-      apiUrl: args.apiUrl,
-      path: '/api/containers?execution=sync',
-      token: args.token,
-      body: {
-        name,
-        image: args.image || '',
-        oci: true,
-        command: ['tail', '-f', '/dev/null'],
-        strict: true,
-      },
-    }),
-    '[quilt-nightly] waiting for container create/start...'
-  );
+  if (args.name) {
+    const existing = await resolveContainerByName(args.apiUrl, args.token, name);
+    if (existing?.found && existing?.container_id) {
+      containerId = existing.container_id;
+      containerIdentifier = name;
+      process.stderr.write(
+        `[quilt-nightly] reusing existing container '${name}' (${containerId})\n`
+      );
+    }
+  }
 
-  const containerId = created?.container_id;
-  if (!containerId) throw new Error('API did not return container_id');
-  process.stderr.write(`[quilt-nightly] container id: ${containerId}\n`);
+  if (!containerId) {
+    process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
+    process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
+
+    const created = await withHeartbeat(
+      apiRequest({
+        method: 'POST',
+        apiUrl: args.apiUrl,
+        path: '/api/containers?execution=sync',
+        token: args.token,
+        body: {
+          name,
+          image: args.image || '',
+          oci: true,
+          command: ['tail', '-f', '/dev/null'],
+          strict: true,
+        },
+      }),
+      '[quilt-nightly] waiting for container create/start...'
+    );
+
+    containerId = created?.container_id;
+    if (!containerId) throw new Error('API did not return container_id');
+    containerIdentifier = name || containerId;
+    createdNew = true;
+    process.stderr.write(`[quilt-nightly] container id: ${containerId}\n`);
+  }
 
   let cleaned = false;
   const maybeCleanup = async () => {
     if (cleaned) return;
     cleaned = true;
-    if (args.cleanup && !args.keep) {
-      await deleteContainer(args.apiUrl, args.token, containerId);
+    if (args.cleanup && !args.keep && createdNew) {
+      await deleteContainer(args.apiUrl, args.token, containerIdentifier);
     }
   };
 
@@ -673,7 +710,7 @@ async function runProfileFlow(args) {
   process.on('SIGTERM', sigHandler);
 
   try {
-    await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
+    await waitForRunning(args.apiUrl, args.token, containerIdentifier, args.startTimeoutMs);
     process.stderr.write(
       `[quilt-nightly] container running; launching ${profile.displayName} TUI...\n`
     );
@@ -682,7 +719,7 @@ async function runProfileFlow(args) {
     const cols = Number.isFinite(args.cols) && args.cols > 0 ? args.cols : size.cols;
     const rows = Number.isFinite(args.rows) && args.rows > 0 ? args.rows : size.rows;
     process.stderr.write(
-      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${args.toolPath})\n`
+      `[quilt-nightly] opening terminal session (container=${containerIdentifier}, shell=${args.toolPath})\n`
     );
     process.stderr.write(
       `[quilt-nightly] terminal attach can take up to ~${Math.ceil(args.startTimeoutMs / 1000)} seconds\n`
@@ -691,7 +728,7 @@ async function runProfileFlow(args) {
     const exitCode = await attachTool({
       apiUrl: args.apiUrl,
       token: args.token,
-      containerId,
+      containerId: containerIdentifier,
       cols,
       rows,
       toolPath: args.toolPath,

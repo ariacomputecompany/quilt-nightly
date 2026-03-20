@@ -24,7 +24,11 @@ It automatically uses:
 ```bash
 npx quilt-nightly --cc
 npx quilt-nightly --codex
+npx quilt-nightly --cc --name my-session
 ```
+
+When `--name` is provided, `quilt-nightly` reuses that named container if it already exists.
+It resumes/starts the existing container and reattaches instead of creating a new one.
 
 ## Environment Loading
 
