@@ -1,6 +1,6 @@
 {
   "name": "quilt-nightly",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "experimental developer images for the quilt runtime",
   "type": "module",
   "bin": {

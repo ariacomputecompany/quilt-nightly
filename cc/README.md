@@ -1,6 +1,6 @@
 # quilt-nightly cc image
 
-`cc` is the Quilt Nightly image for Claude Code workflows.
+`cc` is the source definition for the prebuilt Quilt Nightly image used by Claude Code workflows.
 
 It includes:
 - Node.js + npm
@@ -33,3 +33,4 @@ docker run --rm ghcr.io/ariacomputecompany/quilt-nightly-cc:latest claude --vers
 - No auth credentials are baked into the image.
 - Users authenticate at runtime inside the TUI.
 - Base image updates and Claude Code version pinning should be handled in your release process.
+- `quilt-nightly` runtime launches the published image reference, not this Dockerfile directly.

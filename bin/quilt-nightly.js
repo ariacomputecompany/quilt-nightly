@@ -8,9 +8,9 @@ import { createInterface } from 'node:readline/promises';
 import WebSocket from 'ws';
 
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
-const FALLBACK_CC_DOCKERFILE_URL =
+const DEFAULT_CC_IMAGE_REF =
   'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/master/cc/Dockerfile';
-const FALLBACK_CODEX_DOCKERFILE_URL =
+const DEFAULT_CODEX_IMAGE_REF =
   'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/master/codex/Dockerfile';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
@@ -19,21 +19,17 @@ const PROFILE_CC = {
   key: 'cc',
   flag: '--cc',
   displayName: 'Claude Code',
-  executable: 'claude',
-  fallbackImage: FALLBACK_CC_DOCKERFILE_URL,
-  envImage: 'QUILT_NIGHTLY_CC_IMAGE',
-  envPath: 'QUILT_NIGHTLY_CLAUDE_PATH',
-  fallbackPathCandidates: ['/usr/local/bin/claude', '/usr/bin/claude'],
+  executablePath: '/usr/local/bin/claude',
+  defaultImageRef: DEFAULT_CC_IMAGE_REF,
+  envImageRef: 'QUILT_NIGHTLY_CC_REF',
 };
 const PROFILE_CODEX = {
   key: 'codex',
   flag: '--codex',
   displayName: 'Codex',
-  executable: 'codex',
-  fallbackImage: FALLBACK_CODEX_DOCKERFILE_URL,
-  envImage: 'QUILT_NIGHTLY_CODEX_IMAGE',
-  envPath: 'QUILT_NIGHTLY_CODEX_PATH',
-  fallbackPathCandidates: ['/usr/local/bin/codex', '/usr/bin/codex'],
+  executablePath: '/usr/local/bin/codex',
+  defaultImageRef: DEFAULT_CODEX_IMAGE_REF,
+  envImageRef: 'QUILT_NIGHTLY_CODEX_REF',
 };
 const PROFILES = [PROFILE_CC, PROFILE_CODEX];
 
@@ -149,10 +145,8 @@ Options:
 
 Automatic defaults (no flags needed):
   api_url=${d.apiUrl}
-  cc_image=${process.env.QUILT_NIGHTLY_CC_IMAGE || FALLBACK_CC_DOCKERFILE_URL}
-  codex_image=${process.env.QUILT_NIGHTLY_CODEX_IMAGE || FALLBACK_CODEX_DOCKERFILE_URL}
-  claude_path=${process.env.QUILT_NIGHTLY_CLAUDE_PATH || '(auto-resolve in container)'}
-  codex_path=${process.env.QUILT_NIGHTLY_CODEX_PATH || '(auto-resolve in container)'}
+  cc_image_ref=${process.env.QUILT_NIGHTLY_CC_REF || DEFAULT_CC_IMAGE_REF}
+  codex_image_ref=${process.env.QUILT_NIGHTLY_CODEX_REF || DEFAULT_CODEX_IMAGE_REF}
 `);
 }
 
@@ -198,8 +192,8 @@ function parseArgs(argv) {
   if (args.codex) args.profile = PROFILE_CODEX;
 
   if (args.profile) {
-    args.image = process.env[args.profile.envImage] || args.profile.fallbackImage;
-    args.toolPath = process.env[args.profile.envPath] || '';
+    args.image = process.env[args.profile.envImageRef] || args.profile.defaultImageRef;
+    args.toolPath = args.profile.executablePath;
   }
 
   return args;
@@ -413,44 +407,6 @@ async function deleteContainer(apiUrl, token, containerId) {
   }
 }
 
-async function resolveToolPath(apiUrl, token, containerId, preferredPath, profile) {
-  const preferred = String(preferredPath || '').trim();
-  if (preferred) return preferred;
-
-  const [firstCandidate, secondCandidate] = profile.fallbackPathCandidates;
-  const command = [
-    `if [ -x ${firstCandidate} ]; then echo ${firstCandidate};`,
-    `elif [ -x ${secondCandidate} ]; then echo ${secondCandidate};`,
-    `elif command -v ${profile.executable} >/dev/null 2>&1; then command -v ${profile.executable};`,
-    'else exit 127; fi',
-  ].join(' ');
-
-  const data = await apiRequest({
-    method: 'POST',
-    apiUrl,
-    path: `/api/containers/${encodeURIComponent(containerId)}/exec`,
-    token,
-    body: {
-      command,
-      capture_output: true,
-      detach: false,
-      timeout_ms: 20_000,
-    },
-  });
-
-  const exitCode = Number(data?.exit_code ?? -1);
-  const stdout = String(data?.stdout || '')
-    .trim()
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .find((s) => s);
-
-  if (exitCode !== 0 || !stdout || !stdout.startsWith('/')) {
-    throw new Error(`Unable to resolve ${profile.displayName} binary path via container exec`);
-  }
-  return stdout;
-}
-
 /**
  * @param {{
  *   apiUrl: string,
@@ -649,7 +605,7 @@ async function runProfileFlow(args) {
   const profile = args.profile;
   const name = args.name || randomName(profile);
   process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
-  process.stderr.write('[quilt-nightly] preparing runtime image (this can take a little while)\n');
+  process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
 
   const created = await withHeartbeat(
     apiRequest({
@@ -665,7 +621,7 @@ async function runProfileFlow(args) {
         strict: true,
       },
     }),
-    '[quilt-nightly] pulling/building image...'
+    '[quilt-nightly] waiting for container create/start...'
   );
 
   const containerId = created?.container_id;
@@ -694,22 +650,12 @@ async function runProfileFlow(args) {
     process.stderr.write(
       `[quilt-nightly] container running; launching ${profile.displayName} TUI...\n`
     );
-    process.stderr.write(
-      `[quilt-nightly] resolving ${profile.displayName} executable path via API exec...\n`
-    );
-    const resolvedToolPath = await resolveToolPath(
-      args.apiUrl,
-      args.token,
-      containerId,
-      args.toolPath,
-      profile
-    );
 
     const size = terminalSize();
     const cols = Number.isFinite(args.cols) && args.cols > 0 ? args.cols : size.cols;
     const rows = Number.isFinite(args.rows) && args.rows > 0 ? args.rows : size.rows;
     process.stderr.write(
-      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${resolvedToolPath})\n`
+      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${args.toolPath})\n`
     );
     process.stderr.write(
       `[quilt-nightly] terminal attach can take up to ~${Math.ceil(args.startTimeoutMs / 1000)} seconds\n`
@@ -721,7 +667,7 @@ async function runProfileFlow(args) {
       containerId,
       cols,
       rows,
-      toolPath: resolvedToolPath,
+      toolPath: args.toolPath,
     });
 
     await maybeCleanup();

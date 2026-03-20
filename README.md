@@ -10,11 +10,10 @@ It automatically uses:
 - `QUILT_API_URL` from env, defaulting to `https://backend.quilt.sh`
 - `QUILT_API_KEY` first, then `QUILT_TOKEN`, from env for auth
   - if neither is set, CLI prompts: `Enter your api key:`
-- canonical raw profile Dockerfile URL as the `oci=true` image target:
-  - `cc/Dockerfile` for `--cc`
-  - `codex/Dockerfile` for `--codex`
-- tool binary path auto-resolved in-container via `/api/containers/:id/exec`
-  (optional overrides: `QUILT_NIGHTLY_CLAUDE_PATH`, `QUILT_NIGHTLY_CODEX_PATH`)
+- canonical profile Dockerfile URLs as OCI image source:
+  - `https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/master/cc/Dockerfile` for `--cc`
+  - `https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/master/codex/Dockerfile` for `--codex`
+  - optional overrides: `QUILT_NIGHTLY_CC_REF`, `QUILT_NIGHTLY_CODEX_REF`
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 # quilt-nightly codex image
 
-`codex` is the Quilt Nightly image for Codex workflows.
+`codex` is the source definition for the prebuilt Quilt Nightly image used by Codex workflows.
 
 It includes:
 - Node.js + npm
@@ -33,3 +33,4 @@ docker run --rm ghcr.io/ariacomputecompany/quilt-nightly-codex:latest codex --ve
 - No auth credentials are baked into the image.
 - Users authenticate at runtime inside the TUI.
 - Base image updates and Codex version pinning should be handled in your release process.
+- `quilt-nightly` runtime launches the published image reference, not this Dockerfile directly.
