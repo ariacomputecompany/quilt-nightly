@@ -9,9 +9,9 @@ import WebSocket from 'ws';
 
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
 const DEFAULT_CC_IMAGE_REF =
-  'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/master/cc/Dockerfile';
+  'ghcr.io/ariacomputecompany/quilt-nightly-cc:latest';
 const DEFAULT_CODEX_IMAGE_REF =
-  'https://raw.githubusercontent.com/ariacomputecompany/quilt-nightly/master/codex/Dockerfile';
+  'ghcr.io/ariacomputecompany/quilt-nightly-codex:latest';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
 const ATTACH_HEARTBEAT_MS = 12_000;
@@ -126,6 +126,8 @@ function defaults() {
     // Match quilt.sh auto auth precedence: API key first, then bearer token.
     token: process.env.QUILT_API_KEY || process.env.QUILT_TOKEN || null,
     startTimeoutMs: Number(process.env.QUILT_NIGHTLY_START_TIMEOUT_MS) || DEFAULT_START_TIMEOUT_MS,
+    registryUsername: process.env.QUILT_NIGHTLY_REGISTRY_USERNAME || '',
+    registryPassword: process.env.QUILT_NIGHTLY_REGISTRY_PASSWORD || '',
   };
 }
 
@@ -162,6 +164,8 @@ function parseArgs(argv) {
     token: d.token,
     toolPath: '',
     startTimeoutMs: d.startTimeoutMs,
+    registryUsername: d.registryUsername,
+    registryPassword: d.registryPassword,
     keep: false,
     cleanup: true,
     envFile: null,
@@ -593,6 +597,8 @@ function validateArgs(args) {
  *   image: string,
  *   token: string | null,
  *   toolPath: string,
+ *   registryUsername: string,
+ *   registryPassword: string,
  *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX,
  *   startTimeoutMs: number,
  *   cols: number | null,
@@ -604,6 +610,27 @@ function validateArgs(args) {
 async function runProfileFlow(args) {
   const profile = args.profile;
   const name = args.name || randomName(profile);
+  const pullBody = {
+    reference: args.image || '',
+    force: false,
+  };
+  if (args.registryUsername && args.registryPassword) {
+    pullBody.registry_username = args.registryUsername;
+    pullBody.registry_password = args.registryPassword;
+  }
+
+  process.stderr.write(`[quilt-nightly] ensuring OCI image is available: ${args.image}\n`);
+  await withHeartbeat(
+    apiRequest({
+      method: 'POST',
+      apiUrl: args.apiUrl,
+      path: '/api/oci/images/pull',
+      token: args.token,
+      body: pullBody,
+    }),
+    '[quilt-nightly] pulling OCI image metadata/layers...'
+  );
+
   process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
   process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
 
