@@ -15,10 +15,29 @@ DEFAULT_ADDR = "127.0.0.1:7878"
 STATE_ROOT = Path("/workspace/.quilt/aegis")
 LOGS_DIR = STATE_ROOT / "logs"
 BOOTSTRAP_SCRIPT = Path("/workspace/aegis/bootstrap_aegis_linux.sh")
+AEGIS_CANDIDATE_PATHS = [
+    Path("/root/.local/bin/aegis"),
+    Path("/root/.local/share/aegis/Aegis/bin/aegis_cli"),
+]
 
 
 def ensure_state_dirs() -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_aegis_path() -> str | None:
+    path = shutil_which("aegis")
+    if path:
+        return path
+    for candidate in AEGIS_CANDIDATE_PATHS:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            candidate_dir = str(candidate.parent)
+            current_path = os.getenv("PATH", "")
+            entries = [entry for entry in current_path.split(":") if entry]
+            if candidate_dir not in entries:
+                os.environ["PATH"] = ":".join([candidate_dir, current_path]) if current_path else candidate_dir
+            return str(candidate)
+    return None
 
 
 def aegis_command(mode: str, addr: str, profile: str, start_url: str | None) -> list[str]:
@@ -30,12 +49,12 @@ def aegis_command(mode: str, addr: str, profile: str, start_url: str | None) -> 
 
 
 def ensure_aegis_installed() -> None:
-    if shutil_which("aegis"):
+    if resolve_aegis_path():
         return
     if not BOOTSTRAP_SCRIPT.exists():
         raise SystemExit(f"missing bootstrap script at {BOOTSTRAP_SCRIPT}")
     subprocess.run(["bash", str(BOOTSTRAP_SCRIPT)], check=True)
-    if not shutil_which("aegis"):
+    if not resolve_aegis_path():
         raise SystemExit("aegis install completed without producing an `aegis` binary on PATH")
 
 
@@ -59,7 +78,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     ensure_state_dirs()
     if args.bootstrap:
         ensure_aegis_installed()
-    aegis_path = shutil_which("aegis")
+    aegis_path = resolve_aegis_path()
     payload = {
         "aegis_path": aegis_path,
         "workspace": "/workspace",

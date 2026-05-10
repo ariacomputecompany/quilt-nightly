@@ -62,6 +62,8 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
+mkdir -p /tmp
+chmod 1777 /tmp
 mkdir -p /var/lib/apt/lists/partial
 mkdir -p /var/cache/apt/archives/partial
 

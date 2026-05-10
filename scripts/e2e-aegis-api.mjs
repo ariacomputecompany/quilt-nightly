@@ -140,6 +140,57 @@ async function execInContainer(containerId, command, workdir = '/workspace', tim
   }
 }
 
+async function deleteContainer(containerId) {
+  try {
+    await apiRequest('DELETE', `/api/containers/${encodeURIComponent(containerId)}`);
+    return;
+  } catch (error) {
+    const url = `${API_URL.replace(/\/$/, '')}/api/containers/${encodeURIComponent(containerId)}`;
+    const headerArgs = API_KEY.startsWith('quilt_sk_')
+      ? ['-H', `X-Api-Key: ${API_KEY}`]
+      : ['-H', `Authorization: Bearer ${API_KEY}`];
+    const curlResult = spawnSync(
+      'curl',
+      ['-sS', '-X', 'DELETE', url, ...headerArgs],
+      {
+        encoding: 'utf8',
+        maxBuffer: 1024 * 1024,
+      }
+    );
+    if (curlResult.status === 0) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function runBootstrapDoctor(containerId) {
+  const marker = '__QUILT_AEGIS_EXIT__';
+  const bootstrap = await execInContainer(
+    containerId,
+    [
+      '/bin/sh',
+      '-lc',
+      [
+        'mkdir -p /workspace/.quilt/aegis',
+        'python3 /workspace/aegis/quilt_aegis.py doctor --bootstrap --json >/workspace/.quilt/aegis/bootstrap-e2e.log 2>&1',
+        'code=$?',
+        `echo ${marker}:$code`,
+        'tail -n 200 /workspace/.quilt/aegis/bootstrap-e2e.log',
+      ].join('; '),
+    ],
+    '/workspace',
+    3_600_000
+  );
+  const stdout = String(bootstrap?.stdout || '');
+  const match = stdout.match(new RegExp(`${marker}:(\\d+)`));
+  const exitCode = match ? Number(match[1]) : null;
+  if (exitCode !== 0) {
+    throw new Error(`bootstrap failed: ${bootstrap?.stderr || stdout || 'unknown error'}`);
+  }
+  return bootstrap;
+}
+
 async function main() {
   let containerId = null;
   const name = `e2e-aegis-${Date.now().toString(36)}`;
@@ -200,22 +251,14 @@ async function main() {
 
     if (RUN_BOOTSTRAP) {
       console.log('bootstrap aegis inside prod-gui');
-      const bootstrap = await execInContainer(
-        containerId,
-        ['python3', '/workspace/aegis/quilt_aegis.py', 'doctor', '--bootstrap', '--json'],
-        '/workspace',
-        3_600_000
-      );
-      if (bootstrap?.exit_code !== 0) {
-        throw new Error(`bootstrap failed: ${bootstrap?.stderr || bootstrap?.stdout || 'unknown error'}`);
-      }
+      const bootstrap = await runBootstrapDoctor(containerId);
       console.log(bootstrap.stdout || '');
     }
   } finally {
     if (containerId) {
       try {
         console.log(`delete container ${containerId}`);
-        await apiRequest('DELETE', `/api/containers/${encodeURIComponent(containerId)}`);
+        await deleteContainer(containerId);
       } catch (error) {
         console.error(`cleanup failed for ${containerId}: ${error.message}`);
       }
