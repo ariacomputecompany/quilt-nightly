@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "name": "rlm-surface",
+  "steps": [
+    {
+      "type": "proc_when",
+      "cmd": "node",
+      "args": ["bin/quilt-nightly.js", "--help"],
+      "exit_code": 0,
+      "stdout": "quilt-nightly\n\nUsage:\n  npx quilt-nightly --cc [options]\n  npx quilt-nightly --codex [options]\n  npx quilt-nightly --rlm [options] [-- <command...>]\n\nOptions:\n  --cc                     Launch a Claude Code container flow via API\n  --codex                  Launch a Codex container flow via API\n  --rlm                    Launch an RLM-ready container flow via API\n  -m, --mesh               Use the RLM mesh helper mode (only with --rlm)\n  --name <name>            Container name (default: auto-generated)\n  --keep                   Keep container after terminal exits\n  --                       Pass a startup command into the attached shell\n  --help                   Show this help\n\nAutomatic defaults (no flags needed):\n  api_url=https://backend.quilt.sh\n  cc_image_ref=ghcr.io/ariacomputecompany/quilt-nightly-cc:latest\n  codex_image_ref=ghcr.io/ariacomputecompany/quilt-nightly-codex:latest\n  rlm_image_ref=ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest\n\n",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "node",
+      "args": ["bin/quilt-nightly.js", "--help"],
+      "expect_exit": 0,
+      "expect_stdout": "quilt-nightly\n\nUsage:\n  npx quilt-nightly --cc [options]\n  npx quilt-nightly --codex [options]\n  npx quilt-nightly --rlm [options] [-- <command...>]\n\nOptions:\n  --cc                     Launch a Claude Code container flow via API\n  --codex                  Launch a Codex container flow via API\n  --rlm                    Launch an RLM-ready container flow via API\n  -m, --mesh               Use the RLM mesh helper mode (only with --rlm)\n  --name <name>            Container name (default: auto-generated)\n  --keep                   Keep container after terminal exits\n  --                       Pass a startup command into the attached shell\n  --help                   Show this help\n\nAutomatic defaults (no flags needed):\n  api_url=https://backend.quilt.sh\n  cc_image_ref=ghcr.io/ariacomputecompany/quilt-nightly-cc:latest\n  codex_image_ref=ghcr.io/ariacomputecompany/quilt-nightly-codex:latest\n  rlm_image_ref=ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest\n\n"
+    },
+    {
+      "type": "proc_when",
+      "cmd": "python3",
+      "args": ["rlm/quilt_rlm.py", "examples", "ls"],
+      "exit_code": 0,
+      "stdout": "quickstart.py\n",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "python3",
+      "args": ["rlm/quilt_rlm.py", "examples", "ls"],
+      "expect_exit": 0,
+      "expect_stdout": "quickstart.py\n"
+    }
+  ]
+}

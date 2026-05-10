@@ -13,6 +13,7 @@
     "bin",
     "cc",
     "codex",
+    "rlm",
     "README.md",
     ".env.example"
   ],
@@ -26,6 +27,7 @@
     "nightly",
     "claude",
     "codex",
+    "rlm",
     "containers",
     "developer-tools"
   ],

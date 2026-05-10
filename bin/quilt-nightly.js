@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { spawnSync } from 'node:child_process';
 import { Writable } from 'node:stream';
 import { createInterface } from 'node:readline/promises';
 import WebSocket from 'ws';
@@ -12,6 +13,8 @@ const DEFAULT_CC_IMAGE_REF =
   'ghcr.io/ariacomputecompany/quilt-nightly-cc:latest';
 const DEFAULT_CODEX_IMAGE_REF =
   'ghcr.io/ariacomputecompany/quilt-nightly-codex:latest';
+const DEFAULT_RLM_IMAGE_REF =
+  'ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
 const ATTACH_HEARTBEAT_MS = 12_000;
@@ -31,7 +34,15 @@ const PROFILE_CODEX = {
   defaultImageRef: DEFAULT_CODEX_IMAGE_REF,
   envImageRef: 'QUILT_NIGHTLY_CODEX_REF',
 };
-const PROFILES = [PROFILE_CC, PROFILE_CODEX];
+const PROFILE_RLM = {
+  key: 'rlm',
+  flag: '--rlm',
+  displayName: 'RLM',
+  executablePath: '/bin/bash',
+  defaultImageRef: DEFAULT_RLM_IMAGE_REF,
+  envImageRef: 'QUILT_NIGHTLY_RLM_REF',
+};
+const PROFILES = [PROFILE_CC, PROFILE_CODEX, PROFILE_RLM];
 
 /**
  * @typedef {Object} ApiRequestOptions
@@ -137,18 +148,23 @@ function usage(d) {
 Usage:
   npx quilt-nightly --cc [options]
   npx quilt-nightly --codex [options]
+  npx quilt-nightly --rlm [options] [-- <command...>]
 
 Options:
   --cc                     Launch a Claude Code container flow via API
   --codex                  Launch a Codex container flow via API
+  --rlm                    Launch an RLM-ready container flow via API
+  -m, --mesh               Use the RLM mesh helper mode (only with --rlm)
   --name <name>            Container name (default: auto-generated)
   --keep                   Keep container after terminal exits
+  --                       Pass a startup command into the attached shell
   --help                   Show this help
 
 Automatic defaults (no flags needed):
   api_url=${d.apiUrl}
   cc_image_ref=${process.env.QUILT_NIGHTLY_CC_REF || DEFAULT_CC_IMAGE_REF}
   codex_image_ref=${process.env.QUILT_NIGHTLY_CODEX_REF || DEFAULT_CODEX_IMAGE_REF}
+  rlm_image_ref=${process.env.QUILT_NIGHTLY_RLM_REF || DEFAULT_RLM_IMAGE_REF}
 `);
 }
 
@@ -157,12 +173,15 @@ function parseArgs(argv) {
   const args = {
     cc: false,
     codex: false,
+    rlm: false,
+    mesh: false,
     profile: null,
     apiUrl: d.apiUrl,
     image: '',
     name: null,
     token: d.token,
     toolPath: '',
+    startupCommand: [],
     startTimeoutMs: d.startTimeoutMs,
     registryUsername: d.registryUsername,
     registryPassword: d.registryPassword,
@@ -175,10 +194,17 @@ function parseArgs(argv) {
     help: false,
   };
 
+  let passthroughStart = -1;
   for (let i = 2; i < argv.length; i += 1) {
     const a = argv[i];
+    if (a === '--') {
+      passthroughStart = i + 1;
+      break;
+    }
     if (a === '--cc') args.cc = true;
     else if (a === '--codex') args.codex = true;
+    else if (a === '--rlm') args.rlm = true;
+    else if (a === '--mesh' || a === '-m') args.mesh = true;
     else if (a === '--help' || a === '-h') args.help = true;
     else if (a === '--name') args.name = argv[++i];
     else if (a === '--keep') {
@@ -189,15 +215,27 @@ function parseArgs(argv) {
     }
   }
 
-  if (args.cc && args.codex) {
-    throw new Error('Choose only one profile flag: --cc or --codex');
+  if (passthroughStart !== -1) {
+    args.startupCommand = argv.slice(passthroughStart);
+  }
+
+  if ([args.cc, args.codex, args.rlm].filter(Boolean).length > 1) {
+    throw new Error('Choose only one profile flag: --cc, --codex, or --rlm');
   }
   if (args.cc) args.profile = PROFILE_CC;
   if (args.codex) args.profile = PROFILE_CODEX;
+  if (args.rlm) args.profile = PROFILE_RLM;
+
+  if (args.mesh && !args.rlm) {
+    throw new Error('--mesh/-m can only be used with --rlm');
+  }
 
   if (args.profile) {
     args.image = process.env[args.profile.envImageRef] || args.profile.defaultImageRef;
     args.toolPath = args.profile.executablePath;
+    if (args.profile.key === 'rlm' && args.startupCommand.length === 0) {
+      args.startupCommand = args.mesh ? ['quilt-rlm', 'mesh'] : ['quilt-rlm', 'shell'];
+    }
   }
 
   return args;
@@ -391,10 +429,103 @@ async function waitForRunning(apiUrl, token, containerId, timeoutMs) {
   throw new Error('Timed out waiting for container to reach running state');
 }
 
+async function waitForOperation(apiUrl, token, operationId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const data = await apiRequest({
+      method: 'GET',
+      apiUrl,
+      path: `/api/operations/${encodeURIComponent(operationId)}`,
+      token,
+    });
+
+    const status = String(data?.status || '').toLowerCase();
+    if (status === 'succeeded') return data;
+    if (['failed', 'cancelled', 'canceled', 'timed_out'].includes(status)) {
+      throw new Error(
+        `Operation ${operationId} failed: ${data?.error || data?.message || status}`
+      );
+    }
+
+    await sleep(1000);
+  }
+
+  throw new Error(`Timed out waiting for operation ${operationId}`);
+}
+
 function terminalSize() {
   const cols = Number(process.stdout.columns) || 80;
   const rows = Number(process.stdout.rows) || 24;
   return { cols, rows };
+}
+
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function startupInputForCommand(command) {
+  if (!Array.isArray(command) || command.length === 0) return null;
+  return `exec ${command.map((part) => shQuote(part)).join(' ')}\n`;
+}
+
+function makeSyncArchive(syncPath) {
+  const resolvedPath = path.resolve(process.cwd(), syncPath);
+  const stats = fs.statSync(resolvedPath);
+  const tarArgs = stats.isDirectory()
+    ? ['-C', resolvedPath, '-czf', '-', '.']
+    : ['-C', path.dirname(resolvedPath), '-czf', '-', path.basename(resolvedPath)];
+  const tarResult = spawnSync('tar', tarArgs, {
+    encoding: null,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+
+  if (tarResult.error) {
+    throw tarResult.error;
+  }
+  if (tarResult.status !== 0) {
+    const stderr = Buffer.isBuffer(tarResult.stderr)
+      ? tarResult.stderr.toString('utf8')
+      : String(tarResult.stderr || '');
+    throw new Error(
+      `tar failed while preparing --sync payload: ${stderr.trim() || 'unknown error'}`
+    );
+  }
+
+  return {
+    resolvedPath,
+    content: Buffer.from(tarResult.stdout || []).toString('base64'),
+  };
+}
+
+async function syncArchiveToContainer(apiUrl, token, containerId, syncPath, timeoutMs) {
+  const archive = makeSyncArchive(syncPath);
+  process.stderr.write(
+    `[quilt-nightly] syncing ${archive.resolvedPath} into /workspace via archive upload\n`
+  );
+
+  const accepted = await withHeartbeat(
+    apiRequest({
+      method: 'POST',
+      apiUrl,
+      path: `/api/containers/${encodeURIComponent(containerId)}/archive`,
+      token,
+      body: {
+        content: archive.content,
+        path: '/workspace',
+      },
+    }),
+    '[quilt-nightly] uploading archive and waiting for sync operation...'
+  );
+
+  const operationId = accepted?.operation_id;
+  if (!operationId) {
+    throw new Error('Archive upload did not return operation_id');
+  }
+
+  await withHeartbeat(
+    waitForOperation(apiUrl, token, operationId, timeoutMs),
+    `[quilt-nightly] waiting for archive sync operation ${operationId}...`
+  );
 }
 
 async function deleteContainer(apiUrl, token, containerId) {
@@ -418,10 +549,11 @@ async function deleteContainer(apiUrl, token, containerId) {
  *   containerId: string,
  *   cols: number,
  *   rows: number,
- *   toolPath: string
+ *   toolPath: string,
+ *   startupInput?: string | null
  * }} options
  */
-function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
+function attachTool({ apiUrl, token, containerId, cols, rows, toolPath, startupInput = null }) {
   return new Promise((resolve, reject) => {
     const wsBase = toWsBase(apiUrl).replace(/\/$/, '');
     const params = new URLSearchParams({
@@ -439,6 +571,7 @@ function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
     let rawEnabled = false;
     let ready = false;
     let heartbeat = null;
+    let startupSent = false;
     const stdin = process.stdin;
 
     const onResize = () => {
@@ -484,6 +617,10 @@ function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
           process.stderr.write('[quilt-nightly] waiting for terminal readiness...\n');
         }
       }, ATTACH_HEARTBEAT_MS);
+
+      if (!startupInput) {
+        startupSent = true;
+      }
     });
 
     ws.on('message', (data, isBinary) => {
@@ -510,6 +647,10 @@ function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
         reject(new Error(`${msg.code || 'ERROR'}: ${msg.message || 'unknown websocket error'}`));
       } else if (msg.type === 'ready') {
         ready = true;
+        if (!startupSent && ws.readyState === WebSocket.OPEN) {
+          ws.send(Buffer.from(startupInput, 'utf8'), { binary: true });
+          startupSent = true;
+        }
       } else if (msg.type === 'exit') {
         cleanupIO();
         settled = true;
@@ -577,6 +718,10 @@ function validateArgs(args) {
     throw new Error('--start-timeout-ms must be >= 1000');
   }
 
+  if (args.profile?.key === 'rlm' && !fs.existsSync(process.cwd())) {
+    throw new Error(`Current working directory is not accessible: ${process.cwd()}`);
+  }
+
   if (args.cols !== null && (!Number.isFinite(args.cols) || args.cols < 20 || args.cols > 1000)) {
     throw new Error('--cols must be between 20 and 1000');
   }
@@ -597,9 +742,11 @@ function validateArgs(args) {
  *   image: string,
  *   token: string | null,
  *   toolPath: string,
+ *   startupCommand: string[],
+ *   mesh: boolean,
  *   registryUsername: string,
  *   registryPassword: string,
- *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX,
+ *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX | typeof PROFILE_RLM,
  *   startTimeoutMs: number,
  *   cols: number | null,
  *   rows: number | null,
@@ -609,7 +756,12 @@ function validateArgs(args) {
  */
 async function runProfileFlow(args) {
   const profile = args.profile;
-  const name = args.name || randomName(profile);
+  const autoProfile =
+    profile.key === 'rlm' && args.mesh
+      ? { ...profile, key: 'rlm-mesh' }
+      : profile;
+  const name = args.name || randomName(autoProfile);
+  const startupInput = startupInputForCommand(args.startupCommand);
   const pullBody = {
     reference: args.image || '',
     force: false,
@@ -674,6 +826,15 @@ async function runProfileFlow(args) {
 
   try {
     await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
+    if (profile.key === 'rlm') {
+      await syncArchiveToContainer(
+        args.apiUrl,
+        args.token,
+        containerId,
+        process.cwd(),
+        args.startTimeoutMs
+      );
+    }
     process.stderr.write(
       `[quilt-nightly] container running; launching ${profile.displayName} TUI...\n`
     );
@@ -695,6 +856,7 @@ async function runProfileFlow(args) {
       cols,
       rows,
       toolPath: args.toolPath,
+      startupInput,
     });
 
     await maybeCleanup();
