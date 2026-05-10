@@ -15,6 +15,8 @@ const DEFAULT_CODEX_IMAGE_REF =
   'ghcr.io/ariacomputecompany/quilt-nightly-codex:latest';
 const DEFAULT_RLM_IMAGE_REF =
   'ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest';
+const DEFAULT_AEGIS_IMAGE_REF =
+  'ghcr.io/ariacomputecompany/quilt-nightly-aegis:latest';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
 const ATTACH_HEARTBEAT_MS = 12_000;
@@ -42,7 +44,15 @@ const PROFILE_RLM = {
   defaultImageRef: DEFAULT_RLM_IMAGE_REF,
   envImageRef: 'QUILT_NIGHTLY_RLM_REF',
 };
-const PROFILES = [PROFILE_CC, PROFILE_CODEX, PROFILE_RLM];
+const PROFILE_AEGIS = {
+  key: 'aegis',
+  flag: '--aegis',
+  displayName: 'Aegis',
+  executablePath: '/bin/bash',
+  defaultImageRef: DEFAULT_AEGIS_IMAGE_REF,
+  envImageRef: 'QUILT_NIGHTLY_AEGIS_REF',
+};
+const PROFILES = [PROFILE_CC, PROFILE_CODEX, PROFILE_RLM, PROFILE_AEGIS];
 
 /**
  * @typedef {Object} ApiRequestOptions
@@ -149,12 +159,15 @@ Usage:
   npx quilt-nightly --cc [options]
   npx quilt-nightly --codex [options]
   npx quilt-nightly --rlm [options] [-- <command...>]
+  npx quilt-nightly --aegis [options] [-- <command...>]
 
 Options:
   --cc                     Launch a Claude Code container flow via API
   --codex                  Launch a Codex container flow via API
   --rlm                    Launch an RLM-ready container flow via API
+  --aegis                  Launch an Aegis container flow via API
   -m, --mesh               Use the RLM mesh helper mode (only with --rlm)
+  -s, --s, --swarm [n]     Launch an Aegis swarm (only with --aegis, default n=2)
   --name <name>            Container name (default: auto-generated)
   --keep                   Keep container after terminal exits
   --                       Pass a startup command into the attached shell
@@ -165,7 +178,20 @@ Automatic defaults (no flags needed):
   cc_image_ref=${process.env.QUILT_NIGHTLY_CC_REF || DEFAULT_CC_IMAGE_REF}
   codex_image_ref=${process.env.QUILT_NIGHTLY_CODEX_REF || DEFAULT_CODEX_IMAGE_REF}
   rlm_image_ref=${process.env.QUILT_NIGHTLY_RLM_REF || DEFAULT_RLM_IMAGE_REF}
+  aegis_image_ref=${process.env.QUILT_NIGHTLY_AEGIS_REF || DEFAULT_AEGIS_IMAGE_REF}
 `);
+}
+
+function parseOptionalPositiveInt(argv, index, fallbackValue) {
+  const raw = argv[index + 1];
+  if (!raw || raw.startsWith('-')) {
+    return { value: fallbackValue, consumed: 0 };
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`Expected a positive integer after ${argv[index]}`);
+  }
+  return { value: parsed, consumed: 1 };
 }
 
 function parseArgs(argv) {
@@ -174,7 +200,9 @@ function parseArgs(argv) {
     cc: false,
     codex: false,
     rlm: false,
+    aegis: false,
     mesh: false,
+    swarmCount: 0,
     profile: null,
     apiUrl: d.apiUrl,
     image: '',
@@ -204,7 +232,13 @@ function parseArgs(argv) {
     if (a === '--cc') args.cc = true;
     else if (a === '--codex') args.codex = true;
     else if (a === '--rlm') args.rlm = true;
+    else if (a === '--aegis') args.aegis = true;
     else if (a === '--mesh' || a === '-m') args.mesh = true;
+    else if (a === '--swarm' || a === '--s' || a === '-s') {
+      const parsed = parseOptionalPositiveInt(argv, i, 2);
+      args.swarmCount = parsed.value;
+      i += parsed.consumed;
+    }
     else if (a === '--help' || a === '-h') args.help = true;
     else if (a === '--name') args.name = argv[++i];
     else if (a === '--keep') {
@@ -219,15 +253,19 @@ function parseArgs(argv) {
     args.startupCommand = argv.slice(passthroughStart);
   }
 
-  if ([args.cc, args.codex, args.rlm].filter(Boolean).length > 1) {
-    throw new Error('Choose only one profile flag: --cc, --codex, or --rlm');
+  if ([args.cc, args.codex, args.rlm, args.aegis].filter(Boolean).length > 1) {
+    throw new Error('Choose only one profile flag: --cc, --codex, --rlm, or --aegis');
   }
   if (args.cc) args.profile = PROFILE_CC;
   if (args.codex) args.profile = PROFILE_CODEX;
   if (args.rlm) args.profile = PROFILE_RLM;
+  if (args.aegis) args.profile = PROFILE_AEGIS;
 
   if (args.mesh && !args.rlm) {
     throw new Error('--mesh/-m can only be used with --rlm');
+  }
+  if (args.swarmCount > 0 && !args.aegis) {
+    throw new Error('--swarm/--s/-s can only be used with --aegis');
   }
 
   if (args.profile) {
@@ -235,6 +273,10 @@ function parseArgs(argv) {
     args.toolPath = args.profile.executablePath;
     if (args.profile.key === 'rlm' && args.startupCommand.length === 0) {
       args.startupCommand = args.mesh ? ['quilt-rlm', 'mesh'] : ['quilt-rlm', 'shell'];
+    } else if (args.profile.key === 'aegis' && args.startupCommand.length === 0) {
+      args.startupCommand = args.swarmCount > 0
+        ? ['quilt-aegis', 'shell', '--mode', 'headless', '--swarm-count', String(args.swarmCount)]
+        : ['quilt-aegis', 'shell', '--mode', 'headless'];
     }
   }
 
@@ -702,6 +744,82 @@ function randomName(profile) {
   return `nightly-${profile.key}-${Date.now().toString(36)}`;
 }
 
+function profileAutoSyncEnabled(profile) {
+  return profile.key === 'rlm' || profile.key === 'aegis';
+}
+
+function profileDefaultContainerCommand(args) {
+  const profile = args.profile;
+  if (profile.key === 'aegis' && args.swarmCount > 0) {
+    return ['tail', '-f', '/dev/null'];
+  }
+  return ['tail', '-f', '/dev/null'];
+}
+
+function aegisWorkerContainerCommand(index) {
+  const port = 7878 + index;
+  return [
+    '/usr/local/bin/quilt-aegis',
+    'serve',
+    '--mode',
+    'headless',
+    '--addr',
+    `0.0.0.0:${port}`,
+    '--profile',
+    `swarm-${index}`,
+  ];
+}
+
+async function ensureImageAvailable(args) {
+  const pullBody = {
+    reference: args.image || '',
+    force: false,
+  };
+  if (args.registryUsername && args.registryPassword) {
+    pullBody.registry_username = args.registryUsername;
+    pullBody.registry_password = args.registryPassword;
+  }
+
+  process.stderr.write(`[quilt-nightly] ensuring OCI image is available: ${args.image}\n`);
+  await withHeartbeat(
+    apiRequest({
+      method: 'POST',
+      apiUrl: args.apiUrl,
+      path: '/api/oci/images/pull',
+      token: args.token,
+      body: pullBody,
+    }),
+    '[quilt-nightly] pulling OCI image metadata/layers...'
+  );
+}
+
+async function createManagedContainer(args, name, command) {
+  process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
+  process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
+
+  const created = await withHeartbeat(
+    apiRequest({
+      method: 'POST',
+      apiUrl: args.apiUrl,
+      path: '/api/containers?execution=sync',
+      token: args.token,
+      body: {
+        name,
+        image: args.image || '',
+        oci: true,
+        command,
+        strict: true,
+      },
+    }),
+    '[quilt-nightly] waiting for container create/start...'
+  );
+
+  const containerId = created?.container_id;
+  if (!containerId) throw new Error('API did not return container_id');
+  process.stderr.write(`[quilt-nightly] container id: ${containerId}\n`);
+  return containerId;
+}
+
 function validateArgs(args) {
   let parsed;
   try {
@@ -718,8 +836,15 @@ function validateArgs(args) {
     throw new Error('--start-timeout-ms must be >= 1000');
   }
 
-  if (args.profile?.key === 'rlm' && !fs.existsSync(process.cwd())) {
+  if (
+    (args.profile?.key === 'rlm' || args.profile?.key === 'aegis') &&
+    !fs.existsSync(process.cwd())
+  ) {
     throw new Error(`Current working directory is not accessible: ${process.cwd()}`);
+  }
+
+  if (args.swarmCount !== 0 && (!Number.isInteger(args.swarmCount) || args.swarmCount < 1)) {
+    throw new Error('--swarm must be a positive integer');
   }
 
   if (args.cols !== null && (!Number.isFinite(args.cols) || args.cols < 20 || args.cols > 1000)) {
@@ -744,9 +869,10 @@ function validateArgs(args) {
  *   toolPath: string,
  *   startupCommand: string[],
  *   mesh: boolean,
+ *   swarmCount: number,
  *   registryUsername: string,
  *   registryPassword: string,
- *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX | typeof PROFILE_RLM,
+ *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX | typeof PROFILE_RLM | typeof PROFILE_AEGIS,
  *   startTimeoutMs: number,
  *   cols: number | null,
  *   rows: number | null,
@@ -759,53 +885,22 @@ async function runProfileFlow(args) {
   const autoProfile =
     profile.key === 'rlm' && args.mesh
       ? { ...profile, key: 'rlm-mesh' }
+      : profile.key === 'aegis' && args.swarmCount > 0
+        ? { ...profile, key: 'aegis-swarm' }
       : profile;
   const name = args.name || randomName(autoProfile);
   const startupInput = startupInputForCommand(args.startupCommand);
-  const pullBody = {
-    reference: args.image || '',
-    force: false,
-  };
-  if (args.registryUsername && args.registryPassword) {
-    pullBody.registry_username = args.registryUsername;
-    pullBody.registry_password = args.registryPassword;
+  await ensureImageAvailable(args);
+
+  if (profile.key === 'aegis' && args.swarmCount > 0) {
+    return await runAegisSwarmFlow(args, name, startupInput);
   }
 
-  process.stderr.write(`[quilt-nightly] ensuring OCI image is available: ${args.image}\n`);
-  await withHeartbeat(
-    apiRequest({
-      method: 'POST',
-      apiUrl: args.apiUrl,
-      path: '/api/oci/images/pull',
-      token: args.token,
-      body: pullBody,
-    }),
-    '[quilt-nightly] pulling OCI image metadata/layers...'
+  const containerId = await createManagedContainer(
+    args,
+    name,
+    profileDefaultContainerCommand(args)
   );
-
-  process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
-  process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
-
-  const created = await withHeartbeat(
-    apiRequest({
-      method: 'POST',
-      apiUrl: args.apiUrl,
-      path: '/api/containers?execution=sync',
-      token: args.token,
-      body: {
-        name,
-        image: args.image || '',
-        oci: true,
-        command: ['tail', '-f', '/dev/null'],
-        strict: true,
-      },
-    }),
-    '[quilt-nightly] waiting for container create/start...'
-  );
-
-  const containerId = created?.container_id;
-  if (!containerId) throw new Error('API did not return container_id');
-  process.stderr.write(`[quilt-nightly] container id: ${containerId}\n`);
 
   let cleaned = false;
   const maybeCleanup = async () => {
@@ -826,7 +921,7 @@ async function runProfileFlow(args) {
 
   try {
     await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
-    if (profile.key === 'rlm') {
+    if (profileAutoSyncEnabled(profile)) {
       await syncArchiveToContainer(
         args.apiUrl,
         args.token,
@@ -853,6 +948,81 @@ async function runProfileFlow(args) {
       apiUrl: args.apiUrl,
       token: args.token,
       containerId,
+      cols,
+      rows,
+      toolPath: args.toolPath,
+      startupInput,
+    });
+
+    await maybeCleanup();
+    process.exitCode = typeof exitCode === 'number' ? exitCode : 0;
+  } catch (err) {
+    /** @type {NightlyError} */
+    const nightlyErr = /** @type {NightlyError} */ (err);
+    if (nightlyErr?.status || nightlyErr?.requestId || nightlyErr?.code) {
+      process.stderr.write(
+        `[quilt-nightly] operation failed (status=${nightlyErr.status || 'unknown'}, code=${nightlyErr.code || 'ERROR'}, request_id=${nightlyErr.requestId || 'unknown'}): ${nightlyErr.backendMessage || nightlyErr.message}\n`
+      );
+      nightlyErr.quiltNightlyLogged = true;
+    }
+    throw nightlyErr;
+  } finally {
+    process.off('SIGINT', sigHandler);
+    process.off('SIGTERM', sigHandler);
+  }
+}
+
+async function runAegisSwarmFlow(args, baseName, startupInput) {
+  const leaderName = `${baseName}-0`;
+  const containerIds = [];
+  let cleaned = false;
+
+  const maybeCleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (args.cleanup && !args.keep) {
+      await Promise.all(
+        containerIds.map((containerId) => deleteContainer(args.apiUrl, args.token, containerId))
+      );
+    }
+  };
+
+  const sigHandler = async () => {
+    await maybeCleanup();
+    process.exit(130);
+  };
+
+  process.on('SIGINT', sigHandler);
+  process.on('SIGTERM', sigHandler);
+
+  try {
+    for (let index = 0; index < args.swarmCount; index += 1) {
+      const name = `${baseName}-${index}`;
+      const command = index === 0
+        ? ['tail', '-f', '/dev/null']
+        : aegisWorkerContainerCommand(index);
+      const containerId = await createManagedContainer(args, name, command);
+      containerIds.push(containerId);
+      await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
+      await syncArchiveToContainer(
+        args.apiUrl,
+        args.token,
+        containerId,
+        process.cwd(),
+        args.startTimeoutMs
+      );
+    }
+
+    process.stderr.write(
+      `[quilt-nightly] Aegis swarm ready (${args.swarmCount} containers); attaching to leader ${leaderName}\n`
+    );
+    const size = terminalSize();
+    const cols = Number.isFinite(args.cols) && args.cols > 0 ? args.cols : size.cols;
+    const rows = Number.isFinite(args.rows) && args.rows > 0 ? args.rows : size.rows;
+    const exitCode = await attachTool({
+      apiUrl: args.apiUrl,
+      token: args.token,
+      containerId: containerIds[0],
       cols,
       rows,
       toolPath: args.toolPath,

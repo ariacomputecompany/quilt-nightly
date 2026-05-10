@@ -14,6 +14,7 @@
     "cc",
     "codex",
     "rlm",
+    "aegis",
     "README.md",
     ".env.example"
   ],
@@ -28,6 +29,7 @@
     "claude",
     "codex",
     "rlm",
+    "aegis",
     "containers",
     "developer-tools"
   ],
