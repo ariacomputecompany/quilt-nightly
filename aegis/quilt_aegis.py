@@ -14,6 +14,7 @@ from pathlib import Path
 DEFAULT_ADDR = "127.0.0.1:7878"
 STATE_ROOT = Path("/workspace/.quilt/aegis")
 LOGS_DIR = STATE_ROOT / "logs"
+BOOTSTRAP_SCRIPT = Path("/workspace/aegis/bootstrap_aegis_linux.sh")
 
 
 def ensure_state_dirs() -> None:
@@ -26,6 +27,16 @@ def aegis_command(mode: str, addr: str, profile: str, start_url: str | None) -> 
         command.extend(["--start-url", start_url])
     command.extend(["serve", "--addr", addr])
     return command
+
+
+def ensure_aegis_installed() -> None:
+    if shutil_which("aegis"):
+        return
+    if not BOOTSTRAP_SCRIPT.exists():
+        raise SystemExit(f"missing bootstrap script at {BOOTSTRAP_SCRIPT}")
+    subprocess.run(["bash", str(BOOTSTRAP_SCRIPT)], check=True)
+    if not shutil_which("aegis"):
+        raise SystemExit("aegis install completed without producing an `aegis` binary on PATH")
 
 
 def wait_for_health(addr: str, timeout_s: float = 30.0) -> dict:
@@ -46,12 +57,15 @@ def wait_for_health(addr: str, timeout_s: float = 30.0) -> dict:
 
 def command_doctor(args: argparse.Namespace) -> int:
     ensure_state_dirs()
+    if args.bootstrap:
+        ensure_aegis_installed()
+    aegis_path = shutil_which("aegis")
     payload = {
-        "aegis_path": shutil_which("aegis"),
+        "aegis_path": aegis_path,
         "workspace": "/workspace",
         "state_root": str(STATE_ROOT),
         "aegis_home": os.getenv("AEGIS_HOME", "/root/.aegis"),
-        "doctor": run_json_command(["aegis", "native", "doctor"]),
+        "doctor": run_json_command(["aegis", "native", "doctor"]) if aegis_path else None,
     }
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -79,6 +93,7 @@ def run_json_command(command: list[str]) -> dict | str:
 
 def command_serve(args: argparse.Namespace) -> int:
     ensure_state_dirs()
+    ensure_aegis_installed()
     os.execvp(
         "aegis",
         aegis_command(args.mode, args.addr, args.profile, args.start_url),
@@ -88,6 +103,7 @@ def command_serve(args: argparse.Namespace) -> int:
 
 def command_shell(args: argparse.Namespace) -> int:
     ensure_state_dirs()
+    ensure_aegis_installed()
     if not args.no_serve:
         log_path = LOGS_DIR / f"serve-{int(time.time())}.log"
         with log_path.open("w", encoding="utf-8") as log_handle:
@@ -138,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--bootstrap", action="store_true")
     doctor.set_defaults(func=command_doctor)
 
     serve = subparsers.add_parser("serve")

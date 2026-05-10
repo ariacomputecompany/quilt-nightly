@@ -15,8 +15,7 @@ const DEFAULT_CODEX_IMAGE_REF =
   'ghcr.io/ariacomputecompany/quilt-nightly-codex:latest';
 const DEFAULT_RLM_IMAGE_REF =
   'ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest';
-const DEFAULT_AEGIS_IMAGE_REF =
-  'ghcr.io/ariacomputecompany/quilt-nightly-aegis:latest';
+const DEFAULT_AEGIS_IMAGE_REF = 'prod-gui';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
 const ATTACH_HEARTBEAT_MS = 12_000;
@@ -275,8 +274,8 @@ function parseArgs(argv) {
       args.startupCommand = args.mesh ? ['quilt-rlm', 'mesh'] : ['quilt-rlm', 'shell'];
     } else if (args.profile.key === 'aegis' && args.startupCommand.length === 0) {
       args.startupCommand = args.swarmCount > 0
-        ? ['quilt-aegis', 'shell', '--mode', 'headless', '--swarm-count', String(args.swarmCount)]
-        : ['quilt-aegis', 'shell', '--mode', 'headless'];
+        ? ['python3', '/workspace/aegis/quilt_aegis.py', 'shell', '--mode', 'headful', '--swarm-count', String(args.swarmCount)]
+        : ['python3', '/workspace/aegis/quilt_aegis.py', 'shell', '--mode', 'headful'];
     }
   }
 
@@ -495,6 +494,25 @@ async function waitForOperation(apiUrl, token, operationId, timeoutMs) {
   throw new Error(`Timed out waiting for operation ${operationId}`);
 }
 
+async function waitForContainerReady(apiUrl, token, containerId, timeoutMs, requireGui = false) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const data = await apiRequest({
+      method: 'GET',
+      apiUrl,
+      path: `/api/containers/${encodeURIComponent(containerId)}/ready`,
+      token,
+    });
+    if (data?.exec_ready === true && data?.network_ready === true) {
+      if (!requireGui || data?.gui_ready === true) {
+        return data;
+      }
+    }
+    await sleep(1000);
+  }
+  throw new Error(`Timed out waiting for container ${containerId} readiness`);
+}
+
 function terminalSize() {
   const cols = Number(process.stdout.columns) || 80;
   const rows = Number(process.stdout.rows) || 24;
@@ -568,6 +586,36 @@ async function syncArchiveToContainer(apiUrl, token, containerId, syncPath, time
     waitForOperation(apiUrl, token, operationId, timeoutMs),
     `[quilt-nightly] waiting for archive sync operation ${operationId}...`
   );
+}
+
+async function execInContainer(apiUrl, token, containerId, command, workdir = '/workspace') {
+  return await apiRequest({
+    method: 'POST',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/exec`,
+    token,
+    body: {
+      command,
+      workdir,
+      timeout_ms: 120_000,
+    },
+  });
+}
+
+async function getGuiUrl(apiUrl, token, containerId) {
+  const data = await apiRequest({
+    method: 'GET',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/gui-url`,
+    token,
+  });
+  const guiUrl = data?.gui_url;
+  if (!guiUrl) return null;
+  try {
+    return new URL(guiUrl, apiUrl).toString();
+  } catch {
+    return guiUrl;
+  }
 }
 
 async function deleteContainer(apiUrl, token, containerId) {
@@ -748,29 +796,27 @@ function profileAutoSyncEnabled(profile) {
   return profile.key === 'rlm' || profile.key === 'aegis';
 }
 
+function profileUsesOciImage(profile) {
+  return profile.key !== 'aegis';
+}
+
 function profileDefaultContainerCommand(args) {
   const profile = args.profile;
   if (profile.key === 'aegis' && args.swarmCount > 0) {
-    return ['tail', '-f', '/dev/null'];
+    return null;
   }
   return ['tail', '-f', '/dev/null'];
 }
 
-function aegisWorkerContainerCommand(index) {
+function aegisWorkerStartupCommand(index) {
   const port = 7878 + index;
-  return [
-    '/usr/local/bin/quilt-aegis',
-    'serve',
-    '--mode',
-    'headless',
-    '--addr',
-    `0.0.0.0:${port}`,
-    '--profile',
-    `swarm-${index}`,
-  ];
+  return `nohup python3 /workspace/aegis/quilt_aegis.py serve --mode headless --addr 0.0.0.0:${port} --profile swarm-${index} >/workspace/.quilt/aegis/logs/swarm-${index}.log 2>&1 &`;
 }
 
 async function ensureImageAvailable(args) {
+  if (!profileUsesOciImage(args.profile)) {
+    return;
+  }
   const pullBody = {
     reference: args.image || '',
     force: false,
@@ -797,19 +843,25 @@ async function createManagedContainer(args, name, command) {
   process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
   process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
 
+  const body = {
+    name,
+    image: args.image || '',
+    oci: profileUsesOciImage(args.profile),
+    strict: true,
+  };
+  if (args.profile.key === 'aegis') {
+    body.working_directory = '/workspace';
+  } else if (command) {
+    body.command = command;
+  }
+
   const created = await withHeartbeat(
     apiRequest({
       method: 'POST',
       apiUrl: args.apiUrl,
       path: '/api/containers?execution=sync',
       token: args.token,
-      body: {
-        name,
-        image: args.image || '',
-        oci: true,
-        command,
-        strict: true,
-      },
+      body,
     }),
     '[quilt-nightly] waiting for container create/start...'
   );
@@ -921,6 +973,15 @@ async function runProfileFlow(args) {
 
   try {
     await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
+    if (profile.key === 'aegis') {
+      await waitForContainerReady(
+        args.apiUrl,
+        args.token,
+        containerId,
+        args.startTimeoutMs,
+        true
+      );
+    }
     if (profileAutoSyncEnabled(profile)) {
       await syncArchiveToContainer(
         args.apiUrl,
@@ -929,6 +990,12 @@ async function runProfileFlow(args) {
         process.cwd(),
         args.startTimeoutMs
       );
+    }
+    if (profile.key === 'aegis') {
+      const guiUrl = await getGuiUrl(args.apiUrl, args.token, containerId);
+      if (guiUrl) {
+        process.stderr.write(`[quilt-nightly] Aegis GUI URL: ${guiUrl}\n`);
+      }
     }
     process.stderr.write(
       `[quilt-nightly] container running; launching ${profile.displayName} TUI...\n`
@@ -998,12 +1065,10 @@ async function runAegisSwarmFlow(args, baseName, startupInput) {
   try {
     for (let index = 0; index < args.swarmCount; index += 1) {
       const name = `${baseName}-${index}`;
-      const command = index === 0
-        ? ['tail', '-f', '/dev/null']
-        : aegisWorkerContainerCommand(index);
-      const containerId = await createManagedContainer(args, name, command);
+      const containerId = await createManagedContainer(args, name, profileDefaultContainerCommand(args));
       containerIds.push(containerId);
       await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
+      await waitForContainerReady(args.apiUrl, args.token, containerId, args.startTimeoutMs, true);
       await syncArchiveToContainer(
         args.apiUrl,
         args.token,
@@ -1011,8 +1076,26 @@ async function runAegisSwarmFlow(args, baseName, startupInput) {
         process.cwd(),
         args.startTimeoutMs
       );
+      if (index > 0) {
+        const workerExec = await execInContainer(
+          args.apiUrl,
+          args.token,
+          containerId,
+          ['/bin/sh', '-lc', aegisWorkerStartupCommand(index)],
+          '/workspace'
+        );
+        if (workerExec?.exit_code !== 0) {
+          throw new Error(
+            `failed to start Aegis swarm worker ${index}: ${workerExec?.stderr || workerExec?.stdout || 'unknown error'}`
+          );
+        }
+      }
     }
 
+    const guiUrl = await getGuiUrl(args.apiUrl, args.token, containerIds[0]);
+    if (guiUrl) {
+      process.stderr.write(`[quilt-nightly] Aegis leader GUI URL: ${guiUrl}\n`);
+    }
     process.stderr.write(
       `[quilt-nightly] Aegis swarm ready (${args.swarmCount} containers); attaching to leader ${leaderName}\n`
     );

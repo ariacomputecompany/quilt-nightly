@@ -14,7 +14,7 @@ It automatically uses:
   - `ghcr.io/ariacomputecompany/quilt-nightly-cc:latest` for `--cc`
   - `ghcr.io/ariacomputecompany/quilt-nightly-codex:latest` for `--codex`
   - `ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest` for `--rlm`
-  - `ghcr.io/ariacomputecompany/quilt-nightly-aegis:latest` for `--aegis`
+  - `prod-gui` for `--aegis`
   - optional overrides: `QUILT_NIGHTLY_CC_REF`, `QUILT_NIGHTLY_CODEX_REF`, `QUILT_NIGHTLY_RLM_REF`, `QUILT_NIGHTLY_AEGIS_REF`
 - OCI image preload endpoint: `POST /api/oci/images/pull` (invoked before container create)
 - optional OCI registry credentials for private registries:
@@ -37,7 +37,7 @@ npx quilt-nightly --aegis -s 4
 
 `--rlm` opens a Bash-attached RLM image, syncs the current working directory into `/workspace` through the archive upload API, and injects a startup command into the shell. Without a passthrough command, it defaults to `quilt-rlm shell`; with `-m/--mesh`, it defaults to `quilt-rlm mesh`.
 
-`--aegis` opens a Bash-attached Aegis image, syncs the current working directory into `/workspace`, and defaults to `quilt-aegis shell`, which starts `aegis serve` in the background before dropping into a shell. `-s/--s/--swarm` creates multiple isolated Aegis containers and attaches to the leader.
+`--aegis` creates a `prod-gui` container, syncs the current working directory into `/workspace`, and defaults to `python3 /workspace/aegis/quilt_aegis.py shell --mode headful`, which bootstraps Aegis in the container, starts `aegis serve`, and then drops into a shell. `-s/--s/--swarm` creates multiple isolated `prod-gui` Aegis containers and attaches to the leader.
 
 ## Environment Loading
 

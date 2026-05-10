@@ -1,46 +1,21 @@
-# quilt-nightly aegis image
+# quilt-nightly aegis helper assets
 
-`aegis` is the source definition for the prebuilt Quilt Nightly image used by Linux Aegis workflows.
+`aegis/` contains the helper code and bootstrap script used by `npx quilt-nightly --aegis`.
 
-It is built from the `linux` branch of `ariacomputecompany/aegis` and includes:
-- installed `aegis` CLI
-- installed Linux native runtime and host library
-- built Aegis web dashboard assets
-- Linux display stack tooling (`Xvfb`, `x11vnc`, `xdg-open`)
-- `quilt-aegis` helper CLI
-
-## Build
+Unlike the other Quilt Nightly case studies, Aegis does not run from a dedicated OCI image here. The launcher creates a Quilt `prod-gui` container, syncs the current working directory into `/workspace`, and then starts Aegis from the synced helper:
 
 ```bash
-docker build -t ghcr.io/ariacomputecompany/quilt-nightly-aegis:latest .
+python3 /workspace/aegis/quilt_aegis.py shell --mode headful
 ```
 
-Pin a different upstream ref:
+That flow preserves Aegis headful support by using Quilt's GUI-ready container type and then bootstrapping the Linux branch runtime inside the container when needed.
 
-```bash
-docker build \
-  --build-arg AEGIS_GIT_REF=linux \
-  -t ghcr.io/ariacomputecompany/quilt-nightly-aegis:linux \
-  .
-```
+## Files
 
-## Verify
+- `quilt_aegis.py`: helper CLI for bootstrapping, doctor checks, shell startup, and `aegis serve`
+- `bootstrap_aegis_linux.sh`: installs the Linux branch and its runtime dependencies inside a `prod-gui` container
 
-```bash
-docker run --rm ghcr.io/ariacomputecompany/quilt-nightly-aegis:latest quilt-aegis doctor --json
-docker run --rm ghcr.io/ariacomputecompany/quilt-nightly-aegis:latest aegis usage
-```
-
-## Helper Commands
-
-```bash
-quilt-aegis doctor
-quilt-aegis shell
-quilt-aegis serve --mode headful --addr 0.0.0.0:7878
-quilt-aegis examples
-```
-
-Typical launcher flow:
+## Typical launcher flow
 
 ```bash
 npx quilt-nightly --aegis
@@ -48,4 +23,14 @@ npx quilt-nightly --aegis -- aegis usage
 npx quilt-nightly --aegis -s 4
 ```
 
-`quilt-aegis shell` starts `aegis serve` in the background by default, waits for `/healthz`, and then drops into a shell with the runtime ready.
+## Direct helper usage
+
+```bash
+python3 aegis/quilt_aegis.py doctor
+python3 aegis/quilt_aegis.py doctor --bootstrap --json
+python3 aegis/quilt_aegis.py shell --mode headful
+python3 aegis/quilt_aegis.py serve --mode headless --addr 0.0.0.0:7878
+python3 aegis/quilt_aegis.py examples
+```
+
+`--aegis -s` creates multiple isolated `prod-gui` containers, syncs the repo into each one, starts background Aegis workers in follower containers, and attaches the terminal to the leader.
