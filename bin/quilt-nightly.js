@@ -16,6 +16,9 @@ const DEFAULT_CODEX_IMAGE_REF =
 const DEFAULT_RLM_IMAGE_REF =
   'ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest';
 const DEFAULT_AEGIS_IMAGE_REF = 'prod-gui';
+const DEFAULT_AMP_IMAGE_REF =
+  'ghcr.io/ariacomputecompany/quilt-nightly-amp:latest';
+const DEFAULT_AMP_LISTEN_ADDR = '0.0.0.0:7001';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
 const ATTACH_HEARTBEAT_MS = 12_000;
@@ -51,7 +54,15 @@ const PROFILE_AEGIS = {
   defaultImageRef: DEFAULT_AEGIS_IMAGE_REF,
   envImageRef: 'QUILT_NIGHTLY_AEGIS_REF',
 };
-const PROFILES = [PROFILE_CC, PROFILE_CODEX, PROFILE_RLM, PROFILE_AEGIS];
+const PROFILE_AMP = {
+  key: 'amp',
+  flag: '--amp',
+  displayName: 'AMP',
+  executablePath: '/bin/bash',
+  defaultImageRef: DEFAULT_AMP_IMAGE_REF,
+  envImageRef: 'QUILT_NIGHTLY_AMP_REF',
+};
+const PROFILES = [PROFILE_CC, PROFILE_CODEX, PROFILE_RLM, PROFILE_AEGIS, PROFILE_AMP];
 
 /**
  * @typedef {Object} ApiRequestOptions
@@ -159,12 +170,14 @@ Usage:
   npx quilt-nightly --codex [options]
   npx quilt-nightly --rlm [options] [-- <command...>]
   npx quilt-nightly --aegis [options] [-- <command...>]
+  npx quilt-nightly --amp [options] [-- <command...>]
 
 Options:
   --cc                     Launch a Claude Code container flow via API
   --codex                  Launch a Codex container flow via API
   --rlm                    Launch an RLM-ready container flow via API
   --aegis                  Launch an Aegis container flow via API
+  --amp                    Launch an AMP daemon container flow via API
   -m, --mesh               Use the RLM mesh helper mode (only with --rlm)
   -s, --s, --swarm [n]     Launch an Aegis swarm (only with --aegis, default n=2)
   --name <name>            Container name (default: auto-generated)
@@ -178,6 +191,7 @@ Automatic defaults (no flags needed):
   codex_image_ref=${process.env.QUILT_NIGHTLY_CODEX_REF || DEFAULT_CODEX_IMAGE_REF}
   rlm_image_ref=${process.env.QUILT_NIGHTLY_RLM_REF || DEFAULT_RLM_IMAGE_REF}
   aegis_image_ref=${process.env.QUILT_NIGHTLY_AEGIS_REF || DEFAULT_AEGIS_IMAGE_REF}
+  amp_image_ref=${process.env.QUILT_NIGHTLY_AMP_REF || DEFAULT_AMP_IMAGE_REF}
 `);
 }
 
@@ -200,6 +214,7 @@ function parseArgs(argv) {
     codex: false,
     rlm: false,
     aegis: false,
+    amp: false,
     mesh: false,
     swarmCount: 0,
     profile: null,
@@ -232,6 +247,7 @@ function parseArgs(argv) {
     else if (a === '--codex') args.codex = true;
     else if (a === '--rlm') args.rlm = true;
     else if (a === '--aegis') args.aegis = true;
+    else if (a === '--amp') args.amp = true;
     else if (a === '--mesh' || a === '-m') args.mesh = true;
     else if (a === '--swarm' || a === '--s' || a === '-s') {
       const parsed = parseOptionalPositiveInt(argv, i, 2);
@@ -252,13 +268,14 @@ function parseArgs(argv) {
     args.startupCommand = argv.slice(passthroughStart);
   }
 
-  if ([args.cc, args.codex, args.rlm, args.aegis].filter(Boolean).length > 1) {
-    throw new Error('Choose only one profile flag: --cc, --codex, --rlm, or --aegis');
+  if ([args.cc, args.codex, args.rlm, args.aegis, args.amp].filter(Boolean).length > 1) {
+    throw new Error('Choose only one profile flag: --cc, --codex, --rlm, --aegis, or --amp');
   }
   if (args.cc) args.profile = PROFILE_CC;
   if (args.codex) args.profile = PROFILE_CODEX;
   if (args.rlm) args.profile = PROFILE_RLM;
   if (args.aegis) args.profile = PROFILE_AEGIS;
+  if (args.amp) args.profile = PROFILE_AMP;
 
   if (args.mesh && !args.rlm) {
     throw new Error('--mesh/-m can only be used with --rlm');
@@ -528,6 +545,17 @@ function startupInputForCommand(command) {
   return `exec ${command.map((part) => shQuote(part)).join(' ')}\n`;
 }
 
+function startupInputWithEnv(command, environment) {
+  const exports = Object.entries(environment)
+    .filter(([, value]) => value !== null && value !== undefined && value !== '')
+    .map(([key, value]) => `export ${key}=${shQuote(String(value))}`)
+    .join('\n');
+  const execLine = command && command.length > 0
+    ? `exec ${command.map((part) => shQuote(part)).join(' ')}`
+    : '';
+  return `${exports}${exports ? '\n' : ''}${execLine}\n`;
+}
+
 function makeSyncArchive(syncPath) {
   const resolvedPath = path.resolve(process.cwd(), syncPath);
   const stats = fs.statSync(resolvedPath);
@@ -600,6 +628,91 @@ async function execInContainer(apiUrl, token, containerId, command, workdir = '/
       timeout_ms: 120_000,
     },
   });
+}
+
+async function createPublishedService(apiUrl, token, containerId, body) {
+  return await apiRequest({
+    method: 'POST',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/services`,
+    token,
+    body,
+  });
+}
+
+async function getPublishedService(apiUrl, token, serviceId) {
+  return await apiRequest({
+    method: 'GET',
+    apiUrl,
+    path: `/api/services/${encodeURIComponent(serviceId)}`,
+    token,
+  });
+}
+
+async function waitForPublishedServiceReady(apiUrl, token, serviceId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const data = await getPublishedService(apiUrl, token, serviceId);
+    const status = String(data?.status || '').toLowerCase();
+    if (status === 'ready') {
+      return data;
+    }
+    if (status === 'expired' || status === 'error') {
+      throw new Error(`Published service ${serviceId} entered terminal status: ${status}`);
+    }
+    await sleep(1000);
+  }
+  throw new Error(`Timed out waiting for published service ${serviceId} readiness`);
+}
+
+async function deletePublishedService(apiUrl, token, serviceId) {
+  try {
+    await apiRequest({
+      method: 'DELETE',
+      apiUrl,
+      path: `/api/services/${encodeURIComponent(serviceId)}`,
+      token,
+    });
+    process.stderr.write(`[quilt-nightly] unpublished service ${serviceId}\n`);
+  } catch (e) {
+    process.stderr.write(`[quilt-nightly] service cleanup failed for ${serviceId}: ${e.message}\n`);
+  }
+}
+
+async function readJsonFromExec(apiUrl, token, containerId, command, workdir = '/workspace') {
+  const result = await execInContainer(apiUrl, token, containerId, command, workdir);
+  const exitCode = Number(result?.exit_code ?? -1);
+  if (exitCode !== 0) {
+    throw new Error(
+      `command failed (${exitCode}): ${result?.stderr || result?.stdout || 'unknown error'}`
+    );
+  }
+  const stdout = String(result?.stdout || '').trim();
+  if (!stdout) {
+    throw new Error('command returned empty stdout when JSON output was expected');
+  }
+  try {
+    return JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`failed to parse JSON output: ${error.message}\n${stdout}`);
+  }
+}
+
+async function fetchPublishedServiceHealth(url) {
+  const healthUrl = new URL(url);
+  healthUrl.pathname = `${healthUrl.pathname.replace(/\/$/, '')}/health`;
+  const res = await fetch(healthUrl.toString(), { method: 'GET' });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = text;
+  }
+  if (!res.ok) {
+    throw new Error(`published service health check failed (${res.status}): ${text}`);
+  }
+  return json;
 }
 
 async function getGuiUrl(apiUrl, token, containerId) {
@@ -793,11 +906,15 @@ function randomName(profile) {
 }
 
 function profileAutoSyncEnabled(profile) {
-  return profile.key === 'rlm' || profile.key === 'aegis';
+  return profile.key === 'rlm' || profile.key === 'aegis' || profile.key === 'amp';
 }
 
 function profileUsesOciImage(profile) {
   return profile.key !== 'aegis';
+}
+
+function profileRequiresNetworkReady(profile) {
+  return profile.key === 'aegis' || profile.key === 'amp';
 }
 
 function profileDefaultContainerCommand(args) {
@@ -811,6 +928,50 @@ function profileDefaultContainerCommand(args) {
 function aegisWorkerStartupCommand(index) {
   const port = 7878 + index;
   return `nohup python3 /workspace/aegis/quilt_aegis.py serve --mode headless --addr 0.0.0.0:${port} --profile swarm-${index} >/workspace/.quilt/aegis/logs/swarm-${index}.log 2>&1 &`;
+}
+
+async function bootstrapAmpRuntime(args, containerId) {
+  process.stderr.write('[quilt-nightly] bootstrapping AMP runtime state\n');
+  return await readJsonFromExec(
+    args.apiUrl,
+    args.token,
+    containerId,
+    ['python3', '/workspace/amp/quilt_amp.py', 'bootstrap', '--json'],
+    '/workspace'
+  );
+}
+
+async function launchAmpRuntime(args, containerId) {
+  process.stderr.write(`[quilt-nightly] starting AMP daemon on ${DEFAULT_AMP_LISTEN_ADDR}\n`);
+  return await readJsonFromExec(
+    args.apiUrl,
+    args.token,
+    containerId,
+    ['python3', '/workspace/amp/quilt_amp.py', 'launch', '--addr', DEFAULT_AMP_LISTEN_ADDR, '--json'],
+    '/workspace'
+  );
+}
+
+async function provisionAmpPublishedService(args, containerId) {
+  process.stderr.write('[quilt-nightly] publishing AMP service through Quilt ingress\n');
+  const created = await createPublishedService(args.apiUrl, args.token, containerId, {
+    name: 'amp',
+    target_port: 7001,
+    protocol: 'http',
+    enable_websockets: true,
+    auth_mode: 'service_token',
+  });
+  const serviceId = created?.service_id;
+  if (!serviceId) {
+    throw new Error('AMP published service create did not return service_id');
+  }
+
+  const ready = await withHeartbeat(
+    waitForPublishedServiceReady(args.apiUrl, args.token, serviceId, args.startTimeoutMs),
+    `[quilt-nightly] waiting for published service ${serviceId} readiness...`
+  );
+  await fetchPublishedServiceHealth(ready.public_url);
+  return ready;
 }
 
 async function ensureImageAvailable(args) {
@@ -849,9 +1010,10 @@ async function createManagedContainer(args, name, command) {
     oci: profileUsesOciImage(args.profile),
     strict: true,
   };
-  if (args.profile.key === 'aegis') {
+  if (args.profile.key === 'aegis' || args.profile.key === 'amp') {
     body.working_directory = '/workspace';
-  } else if (command) {
+  }
+  if (args.profile.key !== 'aegis' && command) {
     body.command = command;
   }
 
@@ -889,7 +1051,7 @@ function validateArgs(args) {
   }
 
   if (
-    (args.profile?.key === 'rlm' || args.profile?.key === 'aegis') &&
+    (args.profile?.key === 'rlm' || args.profile?.key === 'aegis' || args.profile?.key === 'amp') &&
     !fs.existsSync(process.cwd())
   ) {
     throw new Error(`Current working directory is not accessible: ${process.cwd()}`);
@@ -924,7 +1086,7 @@ function validateArgs(args) {
  *   swarmCount: number,
  *   registryUsername: string,
  *   registryPassword: string,
- *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX | typeof PROFILE_RLM | typeof PROFILE_AEGIS,
+ *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX | typeof PROFILE_RLM | typeof PROFILE_AEGIS | typeof PROFILE_AMP,
  *   startTimeoutMs: number,
  *   cols: number | null,
  *   rows: number | null,
@@ -941,11 +1103,11 @@ async function runProfileFlow(args) {
         ? { ...profile, key: 'aegis-swarm' }
       : profile;
   const name = args.name || randomName(autoProfile);
-  const startupInput = startupInputForCommand(args.startupCommand);
+  const defaultStartupInput = startupInputForCommand(args.startupCommand);
   await ensureImageAvailable(args);
 
   if (profile.key === 'aegis' && args.swarmCount > 0) {
-    return await runAegisSwarmFlow(args, name, startupInput);
+    return await runAegisSwarmFlow(args, name, defaultStartupInput);
   }
 
   const containerId = await createManagedContainer(
@@ -955,10 +1117,14 @@ async function runProfileFlow(args) {
   );
 
   let cleaned = false;
+  let publishedServiceId = null;
   const maybeCleanup = async () => {
     if (cleaned) return;
     cleaned = true;
     if (args.cleanup && !args.keep) {
+      if (publishedServiceId) {
+        await deletePublishedService(args.apiUrl, args.token, publishedServiceId);
+      }
       await deleteContainer(args.apiUrl, args.token, containerId);
     }
   };
@@ -973,13 +1139,13 @@ async function runProfileFlow(args) {
 
   try {
     await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
-    if (profile.key === 'aegis') {
+    if (profileRequiresNetworkReady(profile)) {
       await waitForContainerReady(
         args.apiUrl,
         args.token,
         containerId,
         args.startTimeoutMs,
-        true
+        profile.key === 'aegis'
       );
     }
     if (profileAutoSyncEnabled(profile)) {
@@ -996,6 +1162,56 @@ async function runProfileFlow(args) {
       if (guiUrl) {
         process.stderr.write(`[quilt-nightly] Aegis GUI URL: ${guiUrl}\n`);
       }
+    }
+    let startupInput = defaultStartupInput;
+    if (profile.key === 'amp') {
+      const bootstrap = await bootstrapAmpRuntime(args, containerId);
+      await launchAmpRuntime(args, containerId);
+      const service = await provisionAmpPublishedService(args, containerId);
+      publishedServiceId = service.service_id || null;
+      const bootstrapAgent = bootstrap.bootstrap_agent || 'owner';
+      const bootstrapToken = bootstrap.bootstrap_token || '';
+      const bootstrapCanonicalAgent =
+        bootstrap.bootstrap_agent_canonical || `${bootstrap.node_id}/${bootstrapAgent}`;
+      process.stderr.write(`[quilt-nightly] AMP public URL: ${service.public_url}\n`);
+      process.stderr.write(`[quilt-nightly] AMP WebSocket URL: ${service.websocket_url}\n`);
+      process.stderr.write(`[quilt-nightly] AMP bootstrap agent: ${bootstrapCanonicalAgent}\n`);
+      process.stderr.write(`[quilt-nightly] AMP bootstrap token: ${bootstrapToken}\n`);
+      const startupEnvironment = {
+        QUILT_AMP_HTTP_URL: service.public_url,
+        QUILT_AMP_WS_URL: service.websocket_url,
+        QUILT_AMP_SERVICE_ID: service.service_id,
+        QUILT_AMP_LOCAL_HTTP_URL: 'http://127.0.0.1:7001',
+        QUILT_AMP_LOCAL_WS_URL: 'ws://127.0.0.1:7001/ws',
+        QUILT_AMP_NODE_ID: bootstrap.node_id,
+        QUILT_AMP_AGENT_ID: bootstrapAgent,
+        QUILT_AMP_AGENT_CANONICAL_ID: bootstrapCanonicalAgent,
+        QUILT_AMP_AGENT_TOKEN: bootstrapToken,
+        QUILT_AMP_CONFIG_PATH: bootstrap.config_path,
+        QUILT_AMP_SQLITE_PATH: bootstrap.sqlite_path,
+      };
+      const startupCommand =
+        args.startupCommand.length > 0
+          ? args.startupCommand
+          : [
+              'python3',
+              '/workspace/amp/quilt_amp.py',
+              'shell',
+              '--addr',
+              DEFAULT_AMP_LISTEN_ADDR,
+              '--no-launch',
+              '--http-url',
+              service.public_url,
+              '--websocket-url',
+              service.websocket_url,
+              '--service-id',
+              service.service_id,
+              '--bootstrap-agent',
+              bootstrapCanonicalAgent,
+              '--bootstrap-token',
+              bootstrapToken,
+            ];
+      startupInput = startupInputWithEnv(startupCommand, startupEnvironment);
     }
     process.stderr.write(
       `[quilt-nightly] container running; launching ${profile.displayName} TUI...\n`

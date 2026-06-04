@@ -15,6 +15,7 @@
     "codex",
     "rlm",
     "aegis",
+    "amp",
     "README.md",
     ".env.example"
   ],
@@ -30,6 +31,7 @@
     "codex",
     "rlm",
     "aegis",
+    "amp",
     "containers",
     "developer-tools"
   ],
