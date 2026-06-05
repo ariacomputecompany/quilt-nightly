@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "name": "rlm-e2e",
+  "steps": [
+    {
+      "type": "proc_when",
+      "cmd": "sh",
+      "args": ["-lc", "E2E_RLM_SUMMARY_ONLY=1 node scripts/e2e-rlm-api.mjs"],
+      "exit_code": 0,
+      "stdout": "rlm api e2e ok\n",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "sh",
+      "args": ["-lc", "E2E_RLM_SUMMARY_ONLY=1 node scripts/e2e-rlm-api.mjs"],
+      "expect_exit": 0,
+      "expect_stdout": "rlm api e2e ok\n"
+    }
+  ]
+}

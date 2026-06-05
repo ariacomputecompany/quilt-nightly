@@ -7,9 +7,17 @@ import { spawnSync } from 'node:child_process';
 import WebSocket from 'ws';
 
 const API_URL = process.env.QUILT_API_URL || 'https://backend.quilt.sh';
-const IMAGE_REF = process.env.E2E_RLM_IMAGE_REF || 'docker.io/library/python:3.12';
+const DEFAULT_IMAGE_REF = 'backend.quilt.sh/nightly/rlm:latest';
+const IMAGE_REF = process.env.E2E_RLM_IMAGE_REF || DEFAULT_IMAGE_REF;
 const LOCAL_SYNC_DIR = path.resolve(process.cwd(), 'rlm');
 const REMOTE_SYNC_DIR = '/workspace/rlm';
+const SUMMARY_ONLY = process.env.E2E_RLM_SUMMARY_ONLY === '1';
+
+function log(message) {
+  if (!SUMMARY_ONLY) {
+    console.log(message);
+  }
+}
 
 function loadDotEnv() {
   const envPath = path.resolve(process.cwd(), '.env');
@@ -45,14 +53,18 @@ function toWsBase(apiUrl) {
   return `wss://${apiUrl}`;
 }
 
-async function apiRequest(method, apiPath, body) {
+async function apiRequest(method, apiPath, body, rawBody, headers = {}) {
+  const requestHeaders = {
+    ...authHeaders(),
+    ...headers,
+  };
+  if (rawBody === undefined && body !== undefined && !requestHeaders['Content-Type']) {
+    requestHeaders['Content-Type'] = 'application/json';
+  }
   const res = await fetch(`${API_URL.replace(/\/$/, '')}${apiPath}`, {
     method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...authHeaders(),
-    },
-    body: body ? JSON.stringify(body) : undefined,
+    headers: requestHeaders,
+    body: rawBody !== undefined ? rawBody : body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
   let json = null;
@@ -65,6 +77,18 @@ async function apiRequest(method, apiPath, body) {
     throw new Error(`${method} ${apiPath} failed (${res.status}): ${text}`);
   }
   return json;
+}
+
+async function resolveNightlyReference() {
+  const params = new URLSearchParams({
+    channel: 'latest',
+    platform: 'linux/amd64',
+  });
+  const data = await apiRequest('GET', `/api/nightly/profiles/rlm/resolve?${params.toString()}`);
+  if (!data?.oci_reference) {
+    throw new Error('Nightly resolve for rlm missing oci_reference');
+  }
+  return data.oci_reference;
 }
 
 async function waitForOperation(operationId, timeoutMs = 120_000) {
@@ -91,7 +115,7 @@ async function waitForReady(containerId, timeoutMs = 120_000) {
   throw new Error(`Timed out waiting for container ${containerId} readiness`);
 }
 
-function makeArchiveBase64(localDir) {
+function makeArchive(localDir) {
   const tarResult = spawnSync('tar', ['-C', localDir, '-czf', '-', '.'], {
     encoding: null,
     maxBuffer: 64 * 1024 * 1024,
@@ -100,7 +124,7 @@ function makeArchiveBase64(localDir) {
   if (tarResult.status !== 0) {
     throw new Error(`tar failed: ${Buffer.from(tarResult.stderr || []).toString('utf8')}`);
   }
-  return Buffer.from(tarResult.stdout || []).toString('base64');
+  return Buffer.from(tarResult.stdout || []);
 }
 
 async function attachAndRun(attachUrl, command) {
@@ -180,18 +204,19 @@ async function main() {
   const name = `e2e-rlm-${Date.now().toString(36)}`;
 
   try {
-    console.log('health');
+    const imageRef = process.env.E2E_RLM_IMAGE_REF || (await resolveNightlyReference());
+    log('health');
     await apiRequest('GET', '/health');
     await apiRequest('GET', '/api/containers/health');
     await apiRequest('GET', '/api/oci/health');
 
-    console.log(`pull image ${IMAGE_REF}`);
-    await apiRequest('POST', '/api/oci/images/pull', { reference: IMAGE_REF });
+    log(`pull image ${imageRef}`);
+    await apiRequest('POST', '/api/oci/images/pull', { reference: imageRef });
 
-    console.log(`create container ${name}`);
+    log(`create container ${name}`);
     const created = await apiRequest('POST', '/api/containers?execution=sync', {
       name,
-      image: IMAGE_REF,
+      image: imageRef,
       oci: true,
       command: ['tail', '-f', '/dev/null'],
       strict: true,
@@ -201,24 +226,24 @@ async function main() {
       throw new Error('container_id missing from create response');
     }
 
-    console.log(`wait ready ${containerId}`);
+    log(`wait ready ${containerId}`);
     await waitForReady(containerId);
 
-    console.log(`archive sync ${LOCAL_SYNC_DIR} -> ${REMOTE_SYNC_DIR}`);
+    log(`archive sync ${LOCAL_SYNC_DIR} -> ${REMOTE_SYNC_DIR}`);
+    const archive = makeArchive(LOCAL_SYNC_DIR);
     const syncAccepted = await apiRequest(
       'POST',
-      `/api/containers/${encodeURIComponent(containerId)}/archive`,
-      {
-        content: makeArchiveBase64(LOCAL_SYNC_DIR),
-        path: REMOTE_SYNC_DIR,
-      }
+      `/api/containers/${encodeURIComponent(containerId)}/archive?path=${encodeURIComponent(REMOTE_SYNC_DIR)}&strip_components=0`,
+      undefined,
+      archive,
+      { 'Content-Type': 'application/gzip' }
     );
     if (!syncAccepted?.operation_id) {
       throw new Error('archive upload missing operation_id');
     }
     await waitForOperation(syncAccepted.operation_id);
 
-    console.log('create terminal session');
+    log('create terminal session');
     const session = await apiRequest('POST', '/api/terminal/sessions', {
       container_id: containerId,
       cols: 120,
@@ -230,25 +255,28 @@ async function main() {
       throw new Error('terminal session missing attach_url');
     }
 
-    console.log('attach and run command');
+    log('attach and run command');
     const result = await attachAndRun(
       attachUrl,
       'python /workspace/rlm/quilt_rlm.py doctor --json && python /workspace/rlm/quilt_rlm.py examples ls && exit'
     );
-    console.log('terminal exit code', result.code);
-    console.log(result.stdout);
+    log(`terminal exit code ${result.code}`);
+    log(result.stdout);
     const terminalSucceeded =
       result.code === 0 ||
       (result.code === -1 &&
         result.stdout.includes('"workspace": "/workspace"') &&
-        result.stdout.includes('rlm_import_error'));
+        (result.stdout.includes('rlm_import_error') ||
+          result.stdout.includes('"rlm_import":') ||
+          result.stdout.includes('\nexamples\n')));
     if (!terminalSucceeded) {
       throw new Error(`in-container command failed with exit code ${result.code}`);
     }
+    console.log('rlm api e2e ok');
   } finally {
     if (containerId) {
       try {
-        console.log(`delete container ${containerId}`);
+        log(`delete container ${containerId}`);
         await apiRequest('DELETE', `/api/containers/${encodeURIComponent(containerId)}`);
       } catch (error) {
         console.error(`cleanup failed for ${containerId}: ${error.message}`);

@@ -10,6 +10,13 @@ const IMAGE_REF = process.env.E2E_AEGIS_IMAGE_REF || 'prod-gui';
 const LOCAL_SYNC_DIR = path.resolve(process.cwd(), 'aegis');
 const REMOTE_SYNC_DIR = '/workspace/aegis';
 const RUN_BOOTSTRAP = process.env.E2E_AEGIS_BOOTSTRAP === '1';
+const SUMMARY_ONLY = process.env.E2E_AEGIS_SUMMARY_ONLY === '1';
+
+function log(message) {
+  if (!SUMMARY_ONLY) {
+    console.log(message);
+  }
+}
 
 function loadDotEnv() {
   const envPath = path.resolve(process.cwd(), '.env');
@@ -39,14 +46,18 @@ function authHeaders() {
   return { Authorization: `Bearer ${API_KEY}` };
 }
 
-async function apiRequest(method, apiPath, body) {
+async function apiRequest(method, apiPath, body, rawBody, headers = {}) {
+  const requestHeaders = {
+    ...authHeaders(),
+    ...headers,
+  };
+  if (rawBody === undefined && body !== undefined && !requestHeaders['Content-Type']) {
+    requestHeaders['Content-Type'] = 'application/json';
+  }
   const res = await fetch(`${API_URL.replace(/\/$/, '')}${apiPath}`, {
     method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...authHeaders(),
-    },
-    body: body ? JSON.stringify(body) : undefined,
+    headers: requestHeaders,
+    body: rawBody !== undefined ? rawBody : body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
   let json = null;
@@ -85,7 +96,7 @@ async function waitForReady(containerId, timeoutMs = 180_000) {
   throw new Error(`Timed out waiting for prod-gui container ${containerId} readiness`);
 }
 
-function makeArchiveBase64(localDir) {
+function makeArchive(localDir) {
   const tarResult = spawnSync('tar', ['-C', localDir, '-czf', '-', '.'], {
     encoding: null,
     maxBuffer: 64 * 1024 * 1024,
@@ -94,7 +105,7 @@ function makeArchiveBase64(localDir) {
   if (tarResult.status !== 0) {
     throw new Error(`tar failed: ${Buffer.from(tarResult.stderr || []).toString('utf8')}`);
   }
-  return Buffer.from(tarResult.stdout || []).toString('base64');
+  return Buffer.from(tarResult.stdout || []);
 }
 
 async function execInContainer(containerId, command, workdir = '/workspace', timeoutMs = 120_000) {
@@ -196,11 +207,11 @@ async function main() {
   const name = `e2e-aegis-${Date.now().toString(36)}`;
 
   try {
-    console.log('health');
+    log('health');
     await apiRequest('GET', '/health');
     await apiRequest('GET', '/api/containers/health');
 
-    console.log(`create prod-gui container ${name}`);
+    log(`create prod-gui container ${name}`);
     const created = await apiRequest('POST', '/api/containers?execution=sync', {
       name,
       image: IMAGE_REF,
@@ -213,31 +224,31 @@ async function main() {
       throw new Error('container_id missing from create response');
     }
 
-    console.log(`wait gui-ready ${containerId}`);
+    log(`wait gui-ready ${containerId}`);
     await waitForReady(containerId);
 
-    console.log('fetch gui url');
+    log('fetch gui url');
     const gui = await apiRequest('GET', `/api/containers/${encodeURIComponent(containerId)}/gui-url`);
     if (!gui?.gui_url) {
       throw new Error('gui_url missing from prod-gui response');
     }
-    console.log(`gui url ${gui.gui_url}`);
+    log(`gui url ${gui.gui_url}`);
 
-    console.log(`archive sync ${LOCAL_SYNC_DIR} -> ${REMOTE_SYNC_DIR}`);
+    log(`archive sync ${LOCAL_SYNC_DIR} -> ${REMOTE_SYNC_DIR}`);
+    const archive = makeArchive(LOCAL_SYNC_DIR);
     const syncAccepted = await apiRequest(
       'POST',
-      `/api/containers/${encodeURIComponent(containerId)}/archive`,
-      {
-        content: makeArchiveBase64(LOCAL_SYNC_DIR),
-        path: REMOTE_SYNC_DIR,
-      }
+      `/api/containers/${encodeURIComponent(containerId)}/archive?path=${encodeURIComponent(REMOTE_SYNC_DIR)}&strip_components=0`,
+      undefined,
+      archive,
+      { 'Content-Type': 'application/gzip' }
     );
     if (!syncAccepted?.operation_id) {
       throw new Error('archive upload missing operation_id');
     }
     await waitForOperation(syncAccepted.operation_id);
 
-    console.log('run helper doctor');
+    log('run helper doctor');
     const doctor = await execInContainer(
       containerId,
       ['python3', '/workspace/aegis/quilt_aegis.py', 'doctor', '--json'],
@@ -247,17 +258,18 @@ async function main() {
     if (doctor?.exit_code !== 0) {
       throw new Error(`doctor failed: ${doctor?.stderr || doctor?.stdout || 'unknown error'}`);
     }
-    console.log(doctor.stdout || '');
+    log(doctor.stdout || '');
 
     if (RUN_BOOTSTRAP) {
-      console.log('bootstrap aegis inside prod-gui');
+      log('bootstrap aegis inside prod-gui');
       const bootstrap = await runBootstrapDoctor(containerId);
-      console.log(bootstrap.stdout || '');
+      log(bootstrap.stdout || '');
     }
+    console.log('aegis api e2e ok');
   } finally {
     if (containerId) {
       try {
-        console.log(`delete container ${containerId}`);
+        log(`delete container ${containerId}`);
         await deleteContainer(containerId);
       } catch (error) {
         console.error(`cleanup failed for ${containerId}: ${error.message}`);

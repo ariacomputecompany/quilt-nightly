@@ -650,14 +650,14 @@ Volume archive upload route:
 POST /api/volumes/<name>/archive
 ```
 
-Archive payload contract for both routes:
+Archive request contract for both routes:
 
-```json
-{
-  "content": "<base64 tar.gz>",
-  "strip_components": 1,
-  "path": "/app"
-}
+```text
+POST /api/containers/<container_id>/archive?path=/app&strip_components=1
+POST /api/volumes/<name>/archive?path=/app&strip_components=1
+Content-Type: application/gzip
+
+<raw tar or tar.gz body>
 ```
 
 Single-file volume write:
@@ -679,6 +679,8 @@ Payload:
 Notes:
 
 - archive uploads are operation-driven
+- `path` and `strip_components` are query parameters, not JSON body fields
+- stale JSON/base64 archive payloads should be rejected
 - single-file volume reads and writes are synchronous
 - `mode` is an octal permission value encoded as an integer such as `644` or `755`
 

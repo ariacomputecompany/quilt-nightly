@@ -10,14 +10,14 @@ import WebSocket from 'ws';
 
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
 const DEFAULT_CC_IMAGE_REF =
-  'ghcr.io/ariacomputecompany/quilt-nightly-cc:latest';
+  'backend.quilt.sh/nightly/cc:latest';
 const DEFAULT_CODEX_IMAGE_REF =
-  'ghcr.io/ariacomputecompany/quilt-nightly-codex:latest';
+  'backend.quilt.sh/nightly/codex:latest';
 const DEFAULT_RLM_IMAGE_REF =
-  'ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest';
+  'backend.quilt.sh/nightly/rlm:latest';
 const DEFAULT_AEGIS_IMAGE_REF = 'prod-gui';
 const DEFAULT_AMP_IMAGE_REF =
-  'ghcr.io/ariacomputecompany/quilt-nightly-amp:latest';
+  'backend.quilt.sh/nightly/amp:latest';
 const DEFAULT_AMP_LISTEN_ADDR = '0.0.0.0:7001';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
@@ -417,14 +417,18 @@ async function withHeartbeat(promise, message, intervalMs = 12_000) {
 /**
  * @param {ApiRequestOptions} options
  */
-async function apiRequest({ method, apiUrl, path: apiPath, token, body }) {
+async function apiRequest({ method, apiUrl, path: apiPath, token, body, rawBody, headers = {} }) {
+  const requestHeaders = {
+    ...authHeaders(token),
+    ...headers,
+  };
+  if (rawBody === undefined && body !== undefined && !requestHeaders['Content-Type']) {
+    requestHeaders['Content-Type'] = 'application/json';
+  }
   const res = await fetch(`${apiUrl.replace(/\/$/, '')}${apiPath}`, {
     method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...authHeaders(token),
-    },
-    body: body ? JSON.stringify(body) : undefined,
+    headers: requestHeaders,
+    body: rawBody !== undefined ? rawBody : body !== undefined ? JSON.stringify(body) : undefined,
   });
 
   const text = await res.text();
@@ -581,7 +585,7 @@ function makeSyncArchive(syncPath) {
 
   return {
     resolvedPath,
-    content: Buffer.from(tarResult.stdout || []).toString('base64'),
+    content: Buffer.from(tarResult.stdout || []),
   };
 }
 
@@ -595,11 +599,13 @@ async function syncArchiveToContainer(apiUrl, token, containerId, syncPath, time
     apiRequest({
       method: 'POST',
       apiUrl,
-      path: `/api/containers/${encodeURIComponent(containerId)}/archive`,
+      path:
+        `/api/containers/${encodeURIComponent(containerId)}/archive` +
+        `?path=${encodeURIComponent('/workspace')}&strip_components=0`,
       token,
-      body: {
-        content: archive.content,
-        path: '/workspace',
+      rawBody: archive.content,
+      headers: {
+        'Content-Type': 'application/gzip',
       },
     }),
     '[quilt-nightly] uploading archive and waiting for sync operation...'
@@ -626,6 +632,18 @@ async function execInContainer(apiUrl, token, containerId, command, workdir = '/
       command,
       workdir,
       timeout_ms: 120_000,
+    },
+  });
+}
+
+async function patchContainerEnvironment(apiUrl, token, containerId, environment) {
+  return await apiRequest({
+    method: 'PATCH',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/env`,
+    token,
+    body: {
+      environment,
     },
   });
 }
@@ -743,6 +761,32 @@ async function deleteContainer(apiUrl, token, containerId) {
   } catch (e) {
     process.stderr.write(`\n[quilt-nightly] cleanup failed: ${e.message}\n`);
   }
+}
+
+function profileUsesNightlyResolve(profile) {
+  return profile.key === 'cc' || profile.key === 'codex' || profile.key === 'rlm' || profile.key === 'amp';
+}
+
+async function resolveNightlyReference(apiUrl, token, profileName) {
+  const query = new URLSearchParams({
+    channel: 'latest',
+    platform: 'linux/amd64',
+  });
+  const data = await apiRequest({
+    method: 'GET',
+    apiUrl,
+    path: `/api/nightly/profiles/${encodeURIComponent(profileName)}/resolve?${query.toString()}`,
+    token,
+  });
+  const ociReference = data?.oci_reference;
+  if (!ociReference) {
+    throw new Error(`Nightly resolve for ${profileName} did not return oci_reference`);
+  }
+  return {
+    reference: ociReference,
+    version: data?.version || null,
+    digest: data?.oci_digest || null,
+  };
 }
 
 /**
@@ -1104,6 +1148,15 @@ async function runProfileFlow(args) {
       : profile;
   const name = args.name || randomName(autoProfile);
   const defaultStartupInput = startupInputForCommand(args.startupCommand);
+  if (profileUsesNightlyResolve(profile) && !process.env[profile.envImageRef]) {
+    const resolved = await resolveNightlyReference(args.apiUrl, args.token, profile.key);
+    args.image = resolved.reference;
+    process.stderr.write(
+      `[quilt-nightly] resolved Nightly ${profile.key} -> ${resolved.reference}` +
+      `${resolved.version ? ` (version=${resolved.version})` : ''}` +
+      `${resolved.digest ? ` (${resolved.digest})` : ''}\n`
+    );
+  }
   await ensureImageAvailable(args);
 
   if (profile.key === 'aegis' && args.swarmCount > 0) {
@@ -1190,6 +1243,12 @@ async function runProfileFlow(args) {
         QUILT_AMP_CONFIG_PATH: bootstrap.config_path,
         QUILT_AMP_SQLITE_PATH: bootstrap.sqlite_path,
       };
+      await patchContainerEnvironment(
+        args.apiUrl,
+        args.token,
+        containerId,
+        startupEnvironment
+      );
       const startupCommand =
         args.startupCommand.length > 0
           ? args.startupCommand

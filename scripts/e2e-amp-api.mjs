@@ -9,7 +9,11 @@ import WebSocket from 'ws';
 const API_URL = process.env.QUILT_API_URL || 'https://backend.quilt.sh';
 const AMP_DIR = path.resolve(process.cwd(), 'amp');
 const REMOTE_SYNC_DIR = '/workspace/amp';
-const IMAGE_REF = `quilt.local/e2e-amp-${Date.now().toString(36)}:latest`;
+const DEFAULT_IMAGE_REF = 'backend.quilt.sh/nightly/amp:latest';
+const BUILD_LOCAL = process.env.E2E_AMP_BUILD_LOCAL === '1';
+const IMAGE_REF =
+  process.env.E2E_AMP_IMAGE_REF ||
+  (BUILD_LOCAL ? `quilt.local/e2e-amp-${Date.now().toString(36)}:latest` : DEFAULT_IMAGE_REF);
 const SUMMARY_ONLY = process.env.E2E_AMP_SUMMARY_ONLY === '1';
 
 function log(message) {
@@ -46,14 +50,18 @@ function authHeaders() {
   return { Authorization: `Bearer ${API_KEY}` };
 }
 
-async function apiRequest(method, apiPath, body) {
+async function apiRequest(method, apiPath, body, rawBody, headers = {}) {
+  const requestHeaders = {
+    ...authHeaders(),
+    ...headers,
+  };
+  if (rawBody === undefined && body !== undefined && !requestHeaders['Content-Type']) {
+    requestHeaders['Content-Type'] = 'application/json';
+  }
   const res = await fetch(`${API_URL.replace(/\/$/, '')}${apiPath}`, {
     method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...authHeaders(),
-    },
-    body: body ? JSON.stringify(body) : undefined,
+    headers: requestHeaders,
+    body: rawBody !== undefined ? rawBody : body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
   let json = null;
@@ -66,6 +74,18 @@ async function apiRequest(method, apiPath, body) {
     throw new Error(`${method} ${apiPath} failed (${res.status}): ${text}`);
   }
   return json;
+}
+
+async function resolveNightlyReference() {
+  const params = new URLSearchParams({
+    channel: 'latest',
+    platform: 'linux/amd64',
+  });
+  const data = await apiRequest('GET', `/api/nightly/profiles/amp/resolve?${params.toString()}`);
+  if (!data?.oci_reference) {
+    throw new Error('Nightly resolve for amp missing oci_reference');
+  }
+  return data.oci_reference;
 }
 
 async function waitForReady(containerId, timeoutMs = 180_000) {
@@ -108,7 +128,7 @@ async function waitForOperation(operationId, timeoutMs = 180_000) {
   throw new Error(`Timed out waiting for operation ${operationId}`);
 }
 
-function makeArchiveBase64(localDir) {
+function makeArchive(localDir) {
   const tarResult = spawnSync('tar', ['-C', localDir, '-czf', '-', '.'], {
     encoding: null,
     maxBuffer: 128 * 1024 * 1024,
@@ -117,7 +137,11 @@ function makeArchiveBase64(localDir) {
   if (tarResult.status !== 0) {
     throw new Error(`tar failed: ${Buffer.from(tarResult.stderr || []).toString('utf8')}`);
   }
-  return Buffer.from(tarResult.stdout || []).toString('base64');
+  return Buffer.from(tarResult.stdout || []);
+}
+
+function makeArchiveBase64(localDir) {
+  return makeArchive(localDir).toString('base64');
 }
 
 async function execInContainer(containerId, command, workdir = '/workspace', timeoutMs = 180_000) {
@@ -153,10 +177,15 @@ async function verifyWebSocket(url, agentId, token) {
   return await new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
     let settled = false;
+    let sawPong = false;
+    const timeout = setTimeout(() => {
+      finish(new Error(`websocket timed out waiting for pong from ${url}`));
+    }, 30_000);
 
     const finish = (error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeout);
       if (error) reject(error);
       else resolve();
       try {
@@ -189,6 +218,7 @@ async function verifyWebSocket(url, agentId, token) {
         return;
       }
       if (message.type === 'pong') {
+        sawPong = true;
         finish();
         return;
       }
@@ -200,44 +230,59 @@ async function verifyWebSocket(url, agentId, token) {
     ws.on('error', (error) => {
       finish(error);
     });
+
+    ws.on('close', () => {
+      if (!sawPong) {
+        finish(new Error(`websocket closed before pong from ${url}`));
+      }
+    });
   });
 }
 
 async function main() {
   let containerId = null;
   let serviceId = null;
+  let imageRef = IMAGE_REF;
 
   try {
+    imageRef =
+      process.env.E2E_AMP_IMAGE_REF ||
+      (BUILD_LOCAL ? IMAGE_REF : await resolveNightlyReference());
     log('health');
     await apiRequest('GET', '/health');
     await apiRequest('GET', '/api/containers/health');
     await apiRequest('GET', '/api/oci/health');
 
-    log('build amp image context');
-    const uploaded = await apiRequest('POST', '/api/build-contexts', {
-      content: makeArchiveBase64(AMP_DIR),
-    });
-    const contextId = uploaded?.context_id;
-    if (!contextId) {
-      throw new Error('build context missing context_id');
-    }
+    if (BUILD_LOCAL) {
+      log('build amp image context');
+      const uploaded = await apiRequest('POST', '/api/build-contexts', {
+        content: makeArchiveBase64(AMP_DIR),
+      });
+      const contextId = uploaded?.context_id;
+      if (!contextId) {
+        throw new Error('build context missing context_id');
+      }
 
-    log(`build image ${IMAGE_REF}`);
-    const built = await apiRequest('POST', '/api/oci/images/build', {
-      context_id: contextId,
-      image_reference: IMAGE_REF,
-      dockerfile_path: 'Dockerfile',
-    });
-    if (!built?.operation_id) {
-      throw new Error(`image build failed: ${JSON.stringify(built)}`);
+      log(`build image ${imageRef}`);
+      const built = await apiRequest('POST', '/api/oci/images/build', {
+        context_id: contextId,
+        image_reference: imageRef,
+        dockerfile_path: 'Dockerfile',
+      });
+      if (!built?.operation_id) {
+        throw new Error(`image build failed: ${JSON.stringify(built)}`);
+      }
+      await waitForOperation(built.operation_id, 900_000);
+    } else {
+      log(`pull image ${imageRef}`);
+      await apiRequest('POST', '/api/oci/images/pull', { reference: imageRef });
     }
-    await waitForOperation(built.operation_id, 900_000);
 
     const name = `e2e-amp-${Date.now().toString(36)}`;
     log(`create container ${name}`);
     const created = await apiRequest('POST', '/api/containers?execution=sync', {
       name,
-      image: IMAGE_REF,
+      image: imageRef,
       oci: true,
       command: ['tail', '-f', '/dev/null'],
       strict: true,
@@ -252,13 +297,13 @@ async function main() {
     await waitForReady(containerId);
 
     log(`archive sync ${AMP_DIR} -> ${REMOTE_SYNC_DIR}`);
+    const archive = makeArchive(AMP_DIR);
     const syncAccepted = await apiRequest(
       'POST',
-      `/api/containers/${encodeURIComponent(containerId)}/archive`,
-      {
-        content: makeArchiveBase64(AMP_DIR),
-        path: REMOTE_SYNC_DIR,
-      }
+      `/api/containers/${encodeURIComponent(containerId)}/archive?path=${encodeURIComponent(REMOTE_SYNC_DIR)}&strip_components=0`,
+      undefined,
+      archive,
+      { 'Content-Type': 'application/gzip' }
     );
     if (!syncAccepted?.operation_id) {
       throw new Error('archive upload missing operation_id');
@@ -325,7 +370,7 @@ async function main() {
       String(bootstrapJson.bootstrap_agent || 'owner'),
       String(bootstrapJson.bootstrap_token || '')
     );
-    console.log('amp ingress e2e ok');
+    console.log(BUILD_LOCAL ? 'amp local-build e2e ok' : 'amp ingress e2e ok');
   } finally {
     if (serviceId) {
       try {
@@ -343,11 +388,13 @@ async function main() {
         console.error(`container cleanup failed for ${containerId}: ${error.message}`);
       }
     }
-    try {
-      log(`delete image ${IMAGE_REF}`);
-      await apiRequest('DELETE', `/api/oci/images?reference=${encodeURIComponent(IMAGE_REF)}`);
-    } catch (error) {
-      console.error(`image cleanup failed for ${IMAGE_REF}: ${error.message}`);
+    if (BUILD_LOCAL) {
+      try {
+        log(`delete image ${imageRef}`);
+        await apiRequest('DELETE', `/api/oci/images?reference=${encodeURIComponent(imageRef)}`);
+      } catch (error) {
+        console.error(`image cleanup failed for ${imageRef}: ${error.message}`);
+      }
     }
   }
 }

@@ -11,12 +11,13 @@ It automatically uses:
 - `QUILT_API_KEY` first, then `QUILT_TOKEN`, from env for auth
   - if neither is set, CLI prompts: `Enter your api key:`
 - canonical OCI image references:
-  - `ghcr.io/ariacomputecompany/quilt-nightly-cc:latest` for `--cc`
-  - `ghcr.io/ariacomputecompany/quilt-nightly-codex:latest` for `--codex`
-  - `ghcr.io/ariacomputecompany/quilt-nightly-rlm:latest` for `--rlm`
+  - `backend.quilt.sh/nightly/cc:latest` for `--cc`
+  - `backend.quilt.sh/nightly/codex:latest` for `--codex`
+  - `backend.quilt.sh/nightly/rlm:latest` for `--rlm`
   - `prod-gui` for `--aegis`
-  - `ghcr.io/ariacomputecompany/quilt-nightly-amp:latest` for `--amp`
+  - `backend.quilt.sh/nightly/amp:latest` for `--amp`
   - optional overrides: `QUILT_NIGHTLY_CC_REF`, `QUILT_NIGHTLY_CODEX_REF`, `QUILT_NIGHTLY_RLM_REF`, `QUILT_NIGHTLY_AEGIS_REF`, `QUILT_NIGHTLY_AMP_REF`
+  - for `cc`, `codex`, `rlm`, and `amp`, the launcher resolves the visible Nightly `latest` channel through `GET /api/nightly/profiles/<profile>/resolve?channel=latest&platform=linux/amd64` and pulls the pinned immutable `oci_reference`
 - OCI image preload endpoint: `POST /api/oci/images/pull` (invoked before container create)
 - optional OCI registry credentials for private registries:
   - `QUILT_NIGHTLY_REGISTRY_USERNAME`
@@ -42,7 +43,7 @@ npx quilt-nightly --amp -- amp inspect system --server http://127.0.0.1:7001 --j
 
 `--aegis` creates a `prod-gui` container, syncs the current working directory into `/workspace`, and defaults to `python3 /workspace/aegis/quilt_aegis.py shell --mode headful`, which bootstraps Aegis in the container, starts `aegis serve`, and then drops into a shell. `-s/--s/--swarm` creates multiple isolated `prod-gui` Aegis containers and attaches to the leader.
 
-`--amp` opens an AMP-ready image, syncs the current working directory into `/workspace`, bootstraps a durable AMP config and SQLite store under `/workspace/.quilt/amp`, starts `amp serve` on `0.0.0.0:7001`, publishes that port through Quilt's native published-services ingress, and then drops into a shell with `QUILT_AMP_HTTP_URL`, `QUILT_AMP_WS_URL`, `QUILT_AMP_SERVICE_ID`, `QUILT_AMP_NODE_ID`, and bootstrap agent credentials exported.
+`--amp` opens an AMP-ready image, syncs the current working directory into `/workspace`, bootstraps a durable AMP config and SQLite store under `/workspace/.quilt/amp`, starts `amp serve` on `0.0.0.0:7001`, publishes that port through Quilt's native published-services ingress, persists the `QUILT_AMP_*` connection details onto the container environment for follow-up sessions, and then drops into a shell with `QUILT_AMP_HTTP_URL`, `QUILT_AMP_WS_URL`, `QUILT_AMP_SERVICE_ID`, `QUILT_AMP_NODE_ID`, and bootstrap agent credentials exported.
 
 ## Environment Loading
 
