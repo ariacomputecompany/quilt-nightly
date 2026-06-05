@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "name": "aegis-e2e",
+  "steps": [
+    {
+      "type": "proc_when",
+      "cmd": "sh",
+      "args": ["-lc", "E2E_AEGIS_SUMMARY_ONLY=1 node scripts/e2e-aegis-api.mjs"],
+      "exit_code": 0,
+      "stdout": "aegis api e2e ok\n",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "sh",
+      "args": ["-lc", "E2E_AEGIS_SUMMARY_ONLY=1 node scripts/e2e-aegis-api.mjs"],
+      "expect_exit": 0,
+      "expect_stdout": "aegis api e2e ok\n"
+    }
+  ]
+}

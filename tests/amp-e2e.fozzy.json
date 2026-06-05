@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "name": "amp-e2e",
+  "steps": [
+    {
+      "type": "proc_when",
+      "cmd": "sh",
+      "args": ["-lc", "E2E_AMP_SUMMARY_ONLY=1 node scripts/e2e-amp-api.mjs"],
+      "exit_code": 0,
+      "stdout": "amp ingress e2e ok\n",
+      "stderr": "",
+      "times": 1
+    },
+    {
+      "type": "proc_spawn",
+      "cmd": "sh",
+      "args": ["-lc", "E2E_AMP_SUMMARY_ONLY=1 node scripts/e2e-amp-api.mjs"],
+      "expect_exit": 0,
+      "expect_stdout": "amp ingress e2e ok\n"
+    }
+  ]
+}

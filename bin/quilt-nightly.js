@@ -3,15 +3,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { spawnSync } from 'node:child_process';
 import { Writable } from 'node:stream';
 import { createInterface } from 'node:readline/promises';
 import WebSocket from 'ws';
 
 const FALLBACK_API_URL = 'https://backend.quilt.sh';
 const DEFAULT_CC_IMAGE_REF =
-  'ghcr.io/ariacomputecompany/quilt-nightly-cc:latest';
+  'backend.quilt.sh/nightly/cc:latest';
 const DEFAULT_CODEX_IMAGE_REF =
-  'ghcr.io/ariacomputecompany/quilt-nightly-codex:latest';
+  'backend.quilt.sh/nightly/codex:latest';
+const DEFAULT_RLM_IMAGE_REF =
+  'backend.quilt.sh/nightly/rlm:latest';
+const DEFAULT_AEGIS_IMAGE_REF = 'prod-gui';
+const DEFAULT_AMP_IMAGE_REF =
+  'backend.quilt.sh/nightly/amp:latest';
+const DEFAULT_AMP_LISTEN_ADDR = '0.0.0.0:7001';
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const DEFAULT_ENV_FILES = ['.env', '.env.local'];
 const ATTACH_HEARTBEAT_MS = 12_000;
@@ -31,7 +38,31 @@ const PROFILE_CODEX = {
   defaultImageRef: DEFAULT_CODEX_IMAGE_REF,
   envImageRef: 'QUILT_NIGHTLY_CODEX_REF',
 };
-const PROFILES = [PROFILE_CC, PROFILE_CODEX];
+const PROFILE_RLM = {
+  key: 'rlm',
+  flag: '--rlm',
+  displayName: 'RLM',
+  executablePath: '/bin/bash',
+  defaultImageRef: DEFAULT_RLM_IMAGE_REF,
+  envImageRef: 'QUILT_NIGHTLY_RLM_REF',
+};
+const PROFILE_AEGIS = {
+  key: 'aegis',
+  flag: '--aegis',
+  displayName: 'Aegis',
+  executablePath: '/bin/bash',
+  defaultImageRef: DEFAULT_AEGIS_IMAGE_REF,
+  envImageRef: 'QUILT_NIGHTLY_AEGIS_REF',
+};
+const PROFILE_AMP = {
+  key: 'amp',
+  flag: '--amp',
+  displayName: 'AMP',
+  executablePath: '/bin/bash',
+  defaultImageRef: DEFAULT_AMP_IMAGE_REF,
+  envImageRef: 'QUILT_NIGHTLY_AMP_REF',
+};
+const PROFILES = [PROFILE_CC, PROFILE_CODEX, PROFILE_RLM, PROFILE_AEGIS, PROFILE_AMP];
 
 /**
  * @typedef {Object} ApiRequestOptions
@@ -137,19 +168,43 @@ function usage(d) {
 Usage:
   npx quilt-nightly --cc [options]
   npx quilt-nightly --codex [options]
+  npx quilt-nightly --rlm [options] [-- <command...>]
+  npx quilt-nightly --aegis [options] [-- <command...>]
+  npx quilt-nightly --amp [options] [-- <command...>]
 
 Options:
   --cc                     Launch a Claude Code container flow via API
   --codex                  Launch a Codex container flow via API
+  --rlm                    Launch an RLM-ready container flow via API
+  --aegis                  Launch an Aegis container flow via API
+  --amp                    Launch an AMP daemon container flow via API
+  -m, --mesh               Use the RLM mesh helper mode (only with --rlm)
+  -s, --s, --swarm [n]     Launch an Aegis swarm (only with --aegis, default n=2)
   --name <name>            Container name; reuses/resumes existing name if present
   --keep                   Keep container after terminal exits
+  --                       Pass a startup command into the attached shell
   --help                   Show this help
 
 Automatic defaults (no flags needed):
   api_url=${d.apiUrl}
   cc_image_ref=${process.env.QUILT_NIGHTLY_CC_REF || DEFAULT_CC_IMAGE_REF}
   codex_image_ref=${process.env.QUILT_NIGHTLY_CODEX_REF || DEFAULT_CODEX_IMAGE_REF}
+  rlm_image_ref=${process.env.QUILT_NIGHTLY_RLM_REF || DEFAULT_RLM_IMAGE_REF}
+  aegis_image_ref=${process.env.QUILT_NIGHTLY_AEGIS_REF || DEFAULT_AEGIS_IMAGE_REF}
+  amp_image_ref=${process.env.QUILT_NIGHTLY_AMP_REF || DEFAULT_AMP_IMAGE_REF}
 `);
+}
+
+function parseOptionalPositiveInt(argv, index, fallbackValue) {
+  const raw = argv[index + 1];
+  if (!raw || raw.startsWith('-')) {
+    return { value: fallbackValue, consumed: 0 };
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`Expected a positive integer after ${argv[index]}`);
+  }
+  return { value: parsed, consumed: 1 };
 }
 
 function parseArgs(argv) {
@@ -157,12 +212,18 @@ function parseArgs(argv) {
   const args = {
     cc: false,
     codex: false,
+    rlm: false,
+    aegis: false,
+    amp: false,
+    mesh: false,
+    swarmCount: 0,
     profile: null,
     apiUrl: d.apiUrl,
     image: '',
     name: null,
     token: d.token,
     toolPath: '',
+    startupCommand: [],
     startTimeoutMs: d.startTimeoutMs,
     registryUsername: d.registryUsername,
     registryPassword: d.registryPassword,
@@ -175,10 +236,24 @@ function parseArgs(argv) {
     help: false,
   };
 
+  let passthroughStart = -1;
   for (let i = 2; i < argv.length; i += 1) {
     const a = argv[i];
+    if (a === '--') {
+      passthroughStart = i + 1;
+      break;
+    }
     if (a === '--cc') args.cc = true;
     else if (a === '--codex') args.codex = true;
+    else if (a === '--rlm') args.rlm = true;
+    else if (a === '--aegis') args.aegis = true;
+    else if (a === '--amp') args.amp = true;
+    else if (a === '--mesh' || a === '-m') args.mesh = true;
+    else if (a === '--swarm' || a === '--s' || a === '-s') {
+      const parsed = parseOptionalPositiveInt(argv, i, 2);
+      args.swarmCount = parsed.value;
+      i += parsed.consumed;
+    }
     else if (a === '--help' || a === '-h') args.help = true;
     else if (a === '--name') args.name = argv[++i];
     else if (a === '--keep') {
@@ -189,15 +264,36 @@ function parseArgs(argv) {
     }
   }
 
-  if (args.cc && args.codex) {
-    throw new Error('Choose only one profile flag: --cc or --codex');
+  if (passthroughStart !== -1) {
+    args.startupCommand = argv.slice(passthroughStart);
+  }
+
+  if ([args.cc, args.codex, args.rlm, args.aegis, args.amp].filter(Boolean).length > 1) {
+    throw new Error('Choose only one profile flag: --cc, --codex, --rlm, --aegis, or --amp');
   }
   if (args.cc) args.profile = PROFILE_CC;
   if (args.codex) args.profile = PROFILE_CODEX;
+  if (args.rlm) args.profile = PROFILE_RLM;
+  if (args.aegis) args.profile = PROFILE_AEGIS;
+  if (args.amp) args.profile = PROFILE_AMP;
+
+  if (args.mesh && !args.rlm) {
+    throw new Error('--mesh/-m can only be used with --rlm');
+  }
+  if (args.swarmCount > 0 && !args.aegis) {
+    throw new Error('--swarm/--s/-s can only be used with --aegis');
+  }
 
   if (args.profile) {
     args.image = process.env[args.profile.envImageRef] || args.profile.defaultImageRef;
     args.toolPath = args.profile.executablePath;
+    if (args.profile.key === 'rlm' && args.startupCommand.length === 0) {
+      args.startupCommand = args.mesh ? ['quilt-rlm', 'mesh'] : ['quilt-rlm', 'shell'];
+    } else if (args.profile.key === 'aegis' && args.startupCommand.length === 0) {
+      args.startupCommand = args.swarmCount > 0
+        ? ['python3', '/workspace/aegis/quilt_aegis.py', 'shell', '--mode', 'headful', '--swarm-count', String(args.swarmCount)]
+        : ['python3', '/workspace/aegis/quilt_aegis.py', 'shell', '--mode', 'headful'];
+    }
   }
 
   return args;
@@ -321,14 +417,18 @@ async function withHeartbeat(promise, message, intervalMs = 12_000) {
 /**
  * @param {ApiRequestOptions} options
  */
-async function apiRequest({ method, apiUrl, path: apiPath, token, body }) {
+async function apiRequest({ method, apiUrl, path: apiPath, token, body, rawBody, headers = {} }) {
+  const requestHeaders = {
+    ...authHeaders(token),
+    ...headers,
+  };
+  if (rawBody === undefined && body !== undefined && !requestHeaders['Content-Type']) {
+    requestHeaders['Content-Type'] = 'application/json';
+  }
   const res = await fetch(`${apiUrl.replace(/\/$/, '')}${apiPath}`, {
     method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...authHeaders(token),
-    },
-    body: body ? JSON.stringify(body) : undefined,
+    headers: requestHeaders,
+    body: rawBody !== undefined ? rawBody : body !== undefined ? JSON.stringify(body) : undefined,
   });
 
   const text = await res.text();
@@ -400,10 +500,262 @@ async function waitForRunning(apiUrl, token, containerId, timeoutMs) {
   throw new Error('Timed out waiting for container to reach running state');
 }
 
+async function waitForOperation(apiUrl, token, operationId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const data = await apiRequest({
+      method: 'GET',
+      apiUrl,
+      path: `/api/operations/${encodeURIComponent(operationId)}`,
+      token,
+    });
+
+    const status = String(data?.status || '').toLowerCase();
+    if (status === 'succeeded') return data;
+    if (['failed', 'cancelled', 'canceled', 'timed_out'].includes(status)) {
+      throw new Error(
+        `Operation ${operationId} failed: ${data?.error || data?.message || status}`
+      );
+    }
+
+    await sleep(1000);
+  }
+
+  throw new Error(`Timed out waiting for operation ${operationId}`);
+}
+
+async function waitForContainerReady(apiUrl, token, containerId, timeoutMs, requireGui = false) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const data = await apiRequest({
+      method: 'GET',
+      apiUrl,
+      path: `/api/containers/${encodeURIComponent(containerId)}/ready`,
+      token,
+    });
+    if (data?.exec_ready === true && data?.network_ready === true) {
+      if (!requireGui || data?.gui_ready === true) {
+        return data;
+      }
+    }
+    await sleep(1000);
+  }
+  throw new Error(`Timed out waiting for container ${containerId} readiness`);
+}
+
 function terminalSize() {
   const cols = Number(process.stdout.columns) || 80;
   const rows = Number(process.stdout.rows) || 24;
   return { cols, rows };
+}
+
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function startupInputForCommand(command) {
+  if (!Array.isArray(command) || command.length === 0) return null;
+  return `exec ${command.map((part) => shQuote(part)).join(' ')}\n`;
+}
+
+function startupInputWithEnv(command, environment) {
+  const exports = Object.entries(environment)
+    .filter(([, value]) => value !== null && value !== undefined && value !== '')
+    .map(([key, value]) => `export ${key}=${shQuote(String(value))}`)
+    .join('\n');
+  const execLine = command && command.length > 0
+    ? `exec ${command.map((part) => shQuote(part)).join(' ')}`
+    : '';
+  return `${exports}${exports ? '\n' : ''}${execLine}\n`;
+}
+
+function makeSyncArchive(syncPath) {
+  const resolvedPath = path.resolve(process.cwd(), syncPath);
+  const stats = fs.statSync(resolvedPath);
+  const tarArgs = stats.isDirectory()
+    ? ['-C', resolvedPath, '-czf', '-', '.']
+    : ['-C', path.dirname(resolvedPath), '-czf', '-', path.basename(resolvedPath)];
+  const tarResult = spawnSync('tar', tarArgs, {
+    encoding: null,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+
+  if (tarResult.error) {
+    throw tarResult.error;
+  }
+  if (tarResult.status !== 0) {
+    const stderr = Buffer.isBuffer(tarResult.stderr)
+      ? tarResult.stderr.toString('utf8')
+      : String(tarResult.stderr || '');
+    throw new Error(
+      `tar failed while preparing --sync payload: ${stderr.trim() || 'unknown error'}`
+    );
+  }
+
+  return {
+    resolvedPath,
+    content: Buffer.from(tarResult.stdout || []),
+  };
+}
+
+async function syncArchiveToContainer(apiUrl, token, containerId, syncPath, timeoutMs) {
+  const archive = makeSyncArchive(syncPath);
+  process.stderr.write(
+    `[quilt-nightly] syncing ${archive.resolvedPath} into /workspace via archive upload\n`
+  );
+
+  const accepted = await withHeartbeat(
+    apiRequest({
+      method: 'POST',
+      apiUrl,
+      path:
+        `/api/containers/${encodeURIComponent(containerId)}/archive` +
+        `?path=${encodeURIComponent('/workspace')}&strip_components=0`,
+      token,
+      rawBody: archive.content,
+      headers: {
+        'Content-Type': 'application/gzip',
+      },
+    }),
+    '[quilt-nightly] uploading archive and waiting for sync operation...'
+  );
+
+  const operationId = accepted?.operation_id;
+  if (!operationId) {
+    throw new Error('Archive upload did not return operation_id');
+  }
+
+  await withHeartbeat(
+    waitForOperation(apiUrl, token, operationId, timeoutMs),
+    `[quilt-nightly] waiting for archive sync operation ${operationId}...`
+  );
+}
+
+async function execInContainer(apiUrl, token, containerId, command, workdir = '/workspace') {
+  return await apiRequest({
+    method: 'POST',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/exec`,
+    token,
+    body: {
+      command,
+      workdir,
+      timeout_ms: 120_000,
+    },
+  });
+}
+
+async function patchContainerEnvironment(apiUrl, token, containerId, environment) {
+  return await apiRequest({
+    method: 'PATCH',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/env`,
+    token,
+    body: {
+      environment,
+    },
+  });
+}
+
+async function createPublishedService(apiUrl, token, containerId, body) {
+  return await apiRequest({
+    method: 'POST',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/services`,
+    token,
+    body,
+  });
+}
+
+async function getPublishedService(apiUrl, token, serviceId) {
+  return await apiRequest({
+    method: 'GET',
+    apiUrl,
+    path: `/api/services/${encodeURIComponent(serviceId)}`,
+    token,
+  });
+}
+
+async function waitForPublishedServiceReady(apiUrl, token, serviceId, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const data = await getPublishedService(apiUrl, token, serviceId);
+    const status = String(data?.status || '').toLowerCase();
+    if (status === 'ready') {
+      return data;
+    }
+    if (status === 'expired' || status === 'error') {
+      throw new Error(`Published service ${serviceId} entered terminal status: ${status}`);
+    }
+    await sleep(1000);
+  }
+  throw new Error(`Timed out waiting for published service ${serviceId} readiness`);
+}
+
+async function deletePublishedService(apiUrl, token, serviceId) {
+  try {
+    await apiRequest({
+      method: 'DELETE',
+      apiUrl,
+      path: `/api/services/${encodeURIComponent(serviceId)}`,
+      token,
+    });
+    process.stderr.write(`[quilt-nightly] unpublished service ${serviceId}\n`);
+  } catch (e) {
+    process.stderr.write(`[quilt-nightly] service cleanup failed for ${serviceId}: ${e.message}\n`);
+  }
+}
+
+async function readJsonFromExec(apiUrl, token, containerId, command, workdir = '/workspace') {
+  const result = await execInContainer(apiUrl, token, containerId, command, workdir);
+  const exitCode = Number(result?.exit_code ?? -1);
+  if (exitCode !== 0) {
+    throw new Error(
+      `command failed (${exitCode}): ${result?.stderr || result?.stdout || 'unknown error'}`
+    );
+  }
+  const stdout = String(result?.stdout || '').trim();
+  if (!stdout) {
+    throw new Error('command returned empty stdout when JSON output was expected');
+  }
+  try {
+    return JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`failed to parse JSON output: ${error.message}\n${stdout}`);
+  }
+}
+
+async function fetchPublishedServiceHealth(url) {
+  const healthUrl = new URL(url);
+  healthUrl.pathname = `${healthUrl.pathname.replace(/\/$/, '')}/health`;
+  const res = await fetch(healthUrl.toString(), { method: 'GET' });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = text;
+  }
+  if (!res.ok) {
+    throw new Error(`published service health check failed (${res.status}): ${text}`);
+  }
+  return json;
+}
+
+async function getGuiUrl(apiUrl, token, containerId) {
+  const data = await apiRequest({
+    method: 'GET',
+    apiUrl,
+    path: `/api/containers/${encodeURIComponent(containerId)}/gui-url`,
+    token,
+  });
+  const guiUrl = data?.gui_url;
+  if (!guiUrl) return null;
+  try {
+    return new URL(guiUrl, apiUrl).toString();
+  } catch {
+    return guiUrl;
+  }
 }
 
 async function deleteContainer(apiUrl, token, containerId) {
@@ -429,6 +781,32 @@ async function resolveContainerByName(apiUrl, token, name) {
   });
 }
 
+function profileUsesNightlyResolve(profile) {
+  return profile.key === 'cc' || profile.key === 'codex' || profile.key === 'rlm' || profile.key === 'amp';
+}
+
+async function resolveNightlyReference(apiUrl, token, profileName) {
+  const query = new URLSearchParams({
+    channel: 'latest',
+    platform: 'linux/amd64',
+  });
+  const data = await apiRequest({
+    method: 'GET',
+    apiUrl,
+    path: `/api/nightly/profiles/${encodeURIComponent(profileName)}/resolve?${query.toString()}`,
+    token,
+  });
+  const ociReference = data?.oci_reference;
+  if (!ociReference) {
+    throw new Error(`Nightly resolve for ${profileName} did not return oci_reference`);
+  }
+  return {
+    reference: ociReference,
+    version: data?.version || null,
+    digest: data?.oci_digest || null,
+  };
+}
+
 /**
  * @param {{
  *   apiUrl: string,
@@ -436,10 +814,11 @@ async function resolveContainerByName(apiUrl, token, name) {
  *   containerId: string,
  *   cols: number,
  *   rows: number,
- *   toolPath: string
+ *   toolPath: string,
+ *   startupInput?: string | null
  * }} options
  */
-function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
+function attachTool({ apiUrl, token, containerId, cols, rows, toolPath, startupInput = null }) {
   return new Promise((resolve, reject) => {
     const wsBase = toWsBase(apiUrl).replace(/\/$/, '');
     const params = new URLSearchParams({
@@ -457,6 +836,7 @@ function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
     let rawEnabled = false;
     let ready = false;
     let heartbeat = null;
+    let startupSent = false;
     const stdin = process.stdin;
 
     const onResize = () => {
@@ -502,6 +882,10 @@ function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
           process.stderr.write('[quilt-nightly] waiting for terminal readiness...\n');
         }
       }, ATTACH_HEARTBEAT_MS);
+
+      if (!startupInput) {
+        startupSent = true;
+      }
     });
 
     ws.on('message', (data, isBinary) => {
@@ -528,6 +912,10 @@ function attachTool({ apiUrl, token, containerId, cols, rows, toolPath }) {
         reject(new Error(`${msg.code || 'ERROR'}: ${msg.message || 'unknown websocket error'}`));
       } else if (msg.type === 'ready') {
         ready = true;
+        if (!startupSent && ws.readyState === WebSocket.OPEN) {
+          ws.send(Buffer.from(startupInput, 'utf8'), { binary: true });
+          startupSent = true;
+        }
       } else if (msg.type === 'exit') {
         cleanupIO();
         settled = true;
@@ -579,6 +967,135 @@ function randomName(profile) {
   return `nightly-${profile.key}-${Date.now().toString(36)}`;
 }
 
+function profileAutoSyncEnabled(profile) {
+  return profile.key === 'rlm' || profile.key === 'aegis' || profile.key === 'amp';
+}
+
+function profileUsesOciImage(profile) {
+  return profile.key !== 'aegis';
+}
+
+function profileRequiresNetworkReady(profile) {
+  return profile.key === 'aegis' || profile.key === 'amp';
+}
+
+function profileDefaultContainerCommand(args) {
+  const profile = args.profile;
+  if (profile.key === 'aegis' && args.swarmCount > 0) {
+    return null;
+  }
+  return ['tail', '-f', '/dev/null'];
+}
+
+function aegisWorkerStartupCommand(index) {
+  const port = 7878 + index;
+  return `nohup python3 /workspace/aegis/quilt_aegis.py serve --mode headless --addr 0.0.0.0:${port} --profile swarm-${index} >/workspace/.quilt/aegis/logs/swarm-${index}.log 2>&1 &`;
+}
+
+async function bootstrapAmpRuntime(args, containerId) {
+  process.stderr.write('[quilt-nightly] bootstrapping AMP runtime state\n');
+  return await readJsonFromExec(
+    args.apiUrl,
+    args.token,
+    containerId,
+    ['python3', '/workspace/amp/quilt_amp.py', 'bootstrap', '--json'],
+    '/workspace'
+  );
+}
+
+async function launchAmpRuntime(args, containerId) {
+  process.stderr.write(`[quilt-nightly] starting AMP daemon on ${DEFAULT_AMP_LISTEN_ADDR}\n`);
+  return await readJsonFromExec(
+    args.apiUrl,
+    args.token,
+    containerId,
+    ['python3', '/workspace/amp/quilt_amp.py', 'launch', '--addr', DEFAULT_AMP_LISTEN_ADDR, '--json'],
+    '/workspace'
+  );
+}
+
+async function provisionAmpPublishedService(args, containerId) {
+  process.stderr.write('[quilt-nightly] publishing AMP service through Quilt ingress\n');
+  const created = await createPublishedService(args.apiUrl, args.token, containerId, {
+    name: 'amp',
+    target_port: 7001,
+    protocol: 'http',
+    enable_websockets: true,
+    auth_mode: 'service_token',
+  });
+  const serviceId = created?.service_id;
+  if (!serviceId) {
+    throw new Error('AMP published service create did not return service_id');
+  }
+
+  const ready = await withHeartbeat(
+    waitForPublishedServiceReady(args.apiUrl, args.token, serviceId, args.startTimeoutMs),
+    `[quilt-nightly] waiting for published service ${serviceId} readiness...`
+  );
+  await fetchPublishedServiceHealth(ready.public_url);
+  return ready;
+}
+
+async function ensureImageAvailable(args) {
+  if (!profileUsesOciImage(args.profile)) {
+    return;
+  }
+  const pullBody = {
+    reference: args.image || '',
+    force: false,
+  };
+  if (args.registryUsername && args.registryPassword) {
+    pullBody.registry_username = args.registryUsername;
+    pullBody.registry_password = args.registryPassword;
+  }
+
+  process.stderr.write(`[quilt-nightly] ensuring OCI image is available: ${args.image}\n`);
+  await withHeartbeat(
+    apiRequest({
+      method: 'POST',
+      apiUrl: args.apiUrl,
+      path: '/api/oci/images/pull',
+      token: args.token,
+      body: pullBody,
+    }),
+    '[quilt-nightly] pulling OCI image metadata/layers...'
+  );
+}
+
+async function createManagedContainer(args, name, command) {
+  process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
+  process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
+
+  const body = {
+    name,
+    image: args.image || '',
+    oci: profileUsesOciImage(args.profile),
+    strict: true,
+  };
+  if (args.profile.key === 'aegis' || args.profile.key === 'amp') {
+    body.working_directory = '/workspace';
+  }
+  if (args.profile.key !== 'aegis' && command) {
+    body.command = command;
+  }
+
+  const created = await withHeartbeat(
+    apiRequest({
+      method: 'POST',
+      apiUrl: args.apiUrl,
+      path: '/api/containers?execution=sync',
+      token: args.token,
+      body,
+    }),
+    '[quilt-nightly] waiting for container create/start...'
+  );
+
+  const containerId = created?.container_id;
+  if (!containerId) throw new Error('API did not return container_id');
+  process.stderr.write(`[quilt-nightly] container id: ${containerId}\n`);
+  return containerId;
+}
+
 function validateArgs(args) {
   let parsed;
   try {
@@ -593,6 +1110,17 @@ function validateArgs(args) {
 
   if (!Number.isFinite(args.startTimeoutMs) || args.startTimeoutMs < 1000) {
     throw new Error('--start-timeout-ms must be >= 1000');
+  }
+
+  if (
+    (args.profile?.key === 'rlm' || args.profile?.key === 'aegis' || args.profile?.key === 'amp') &&
+    !fs.existsSync(process.cwd())
+  ) {
+    throw new Error(`Current working directory is not accessible: ${process.cwd()}`);
+  }
+
+  if (args.swarmCount !== 0 && (!Number.isInteger(args.swarmCount) || args.swarmCount < 1)) {
+    throw new Error('--swarm must be a positive integer');
   }
 
   if (args.cols !== null && (!Number.isFinite(args.cols) || args.cols < 20 || args.cols > 1000)) {
@@ -615,9 +1143,12 @@ function validateArgs(args) {
  *   image: string,
  *   token: string | null,
  *   toolPath: string,
+ *   startupCommand: string[],
+ *   mesh: boolean,
+ *   swarmCount: number,
  *   registryUsername: string,
  *   registryPassword: string,
- *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX,
+ *   profile: typeof PROFILE_CC | typeof PROFILE_CODEX | typeof PROFILE_RLM | typeof PROFILE_AEGIS | typeof PROFILE_AMP,
  *   startTimeoutMs: number,
  *   cols: number | null,
  *   rows: number | null,
@@ -627,37 +1158,36 @@ function validateArgs(args) {
  */
 async function runProfileFlow(args) {
   const profile = args.profile;
-  const name = args.name || randomName(profile);
-  const pullBody = {
-    reference: args.image || '',
-    force: false,
-  };
-  if (args.registryUsername && args.registryPassword) {
-    pullBody.registry_username = args.registryUsername;
-    pullBody.registry_password = args.registryPassword;
+  const autoProfile =
+    profile.key === 'rlm' && args.mesh
+      ? { ...profile, key: 'rlm-mesh' }
+      : profile.key === 'aegis' && args.swarmCount > 0
+        ? { ...profile, key: 'aegis-swarm' }
+      : profile;
+  const name = args.name || randomName(autoProfile);
+  const defaultStartupInput = startupInputForCommand(args.startupCommand);
+  if (profileUsesNightlyResolve(profile) && !process.env[profile.envImageRef]) {
+    const resolved = await resolveNightlyReference(args.apiUrl, args.token, profile.key);
+    args.image = resolved.reference;
+    process.stderr.write(
+      `[quilt-nightly] resolved Nightly ${profile.key} -> ${resolved.reference}` +
+      `${resolved.version ? ` (version=${resolved.version})` : ''}` +
+      `${resolved.digest ? ` (${resolved.digest})` : ''}\n`
+    );
   }
+  await ensureImageAvailable(args);
 
-  process.stderr.write(`[quilt-nightly] ensuring OCI image is available: ${args.image}\n`);
-  await withHeartbeat(
-    apiRequest({
-      method: 'POST',
-      apiUrl: args.apiUrl,
-      path: '/api/oci/images/pull',
-      token: args.token,
-      body: pullBody,
-    }),
-    '[quilt-nightly] pulling OCI image metadata/layers...'
-  );
+  if (profile.key === 'aegis' && args.swarmCount > 0) {
+    return await runAegisSwarmFlow(args, name, defaultStartupInput);
+  }
 
   let createdNew = false;
   let containerId = '';
-  let containerIdentifier = name;
 
   if (args.name) {
     const existing = await resolveContainerByName(args.apiUrl, args.token, name);
     if (existing?.found && existing?.container_id) {
       containerId = existing.container_id;
-      containerIdentifier = name;
       process.stderr.write(
         `[quilt-nightly] reusing existing container '${name}' (${containerId})\n`
       );
@@ -665,39 +1195,25 @@ async function runProfileFlow(args) {
   }
 
   if (!containerId) {
-    process.stderr.write(`[quilt-nightly] creating container '${name}' via API\n`);
-    process.stderr.write(`[quilt-nightly] launching with image ${args.image}\n`);
-
-    const created = await withHeartbeat(
-      apiRequest({
-        method: 'POST',
-        apiUrl: args.apiUrl,
-        path: '/api/containers?execution=sync',
-        token: args.token,
-        body: {
-          name,
-          image: args.image || '',
-          oci: true,
-          command: ['tail', '-f', '/dev/null'],
-          strict: true,
-        },
-      }),
-      '[quilt-nightly] waiting for container create/start...'
+    containerId = await createManagedContainer(
+      args,
+      name,
+      profileDefaultContainerCommand(args)
     );
-
-    containerId = created?.container_id;
-    if (!containerId) throw new Error('API did not return container_id');
-    containerIdentifier = name || containerId;
     createdNew = true;
-    process.stderr.write(`[quilt-nightly] container id: ${containerId}\n`);
   }
-
   let cleaned = false;
+  let publishedServiceId = null;
   const maybeCleanup = async () => {
     if (cleaned) return;
     cleaned = true;
-    if (args.cleanup && !args.keep && createdNew) {
-      await deleteContainer(args.apiUrl, args.token, containerIdentifier);
+    if (args.cleanup && !args.keep) {
+      if (publishedServiceId) {
+        await deletePublishedService(args.apiUrl, args.token, publishedServiceId);
+      }
+      if (createdNew) {
+        await deleteContainer(args.apiUrl, args.token, containerId);
+      }
     }
   };
 
@@ -710,7 +1226,87 @@ async function runProfileFlow(args) {
   process.on('SIGTERM', sigHandler);
 
   try {
-    await waitForRunning(args.apiUrl, args.token, containerIdentifier, args.startTimeoutMs);
+    await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
+    if (profileRequiresNetworkReady(profile)) {
+      await waitForContainerReady(
+        args.apiUrl,
+        args.token,
+        containerId,
+        args.startTimeoutMs,
+        profile.key === 'aegis'
+      );
+    }
+    if (profileAutoSyncEnabled(profile)) {
+      await syncArchiveToContainer(
+        args.apiUrl,
+        args.token,
+        containerId,
+        process.cwd(),
+        args.startTimeoutMs
+      );
+    }
+    if (profile.key === 'aegis') {
+      const guiUrl = await getGuiUrl(args.apiUrl, args.token, containerId);
+      if (guiUrl) {
+        process.stderr.write(`[quilt-nightly] Aegis GUI URL: ${guiUrl}\n`);
+      }
+    }
+    let startupInput = defaultStartupInput;
+    if (profile.key === 'amp') {
+      const bootstrap = await bootstrapAmpRuntime(args, containerId);
+      await launchAmpRuntime(args, containerId);
+      const service = await provisionAmpPublishedService(args, containerId);
+      publishedServiceId = service.service_id || null;
+      const bootstrapAgent = bootstrap.bootstrap_agent || 'owner';
+      const bootstrapToken = bootstrap.bootstrap_token || '';
+      const bootstrapCanonicalAgent =
+        bootstrap.bootstrap_agent_canonical || `${bootstrap.node_id}/${bootstrapAgent}`;
+      process.stderr.write(`[quilt-nightly] AMP public URL: ${service.public_url}\n`);
+      process.stderr.write(`[quilt-nightly] AMP WebSocket URL: ${service.websocket_url}\n`);
+      process.stderr.write(`[quilt-nightly] AMP bootstrap agent: ${bootstrapCanonicalAgent}\n`);
+      process.stderr.write(`[quilt-nightly] AMP bootstrap token: ${bootstrapToken}\n`);
+      const startupEnvironment = {
+        QUILT_AMP_HTTP_URL: service.public_url,
+        QUILT_AMP_WS_URL: service.websocket_url,
+        QUILT_AMP_SERVICE_ID: service.service_id,
+        QUILT_AMP_LOCAL_HTTP_URL: 'http://127.0.0.1:7001',
+        QUILT_AMP_LOCAL_WS_URL: 'ws://127.0.0.1:7001/ws',
+        QUILT_AMP_NODE_ID: bootstrap.node_id,
+        QUILT_AMP_AGENT_ID: bootstrapAgent,
+        QUILT_AMP_AGENT_CANONICAL_ID: bootstrapCanonicalAgent,
+        QUILT_AMP_AGENT_TOKEN: bootstrapToken,
+        QUILT_AMP_CONFIG_PATH: bootstrap.config_path,
+        QUILT_AMP_SQLITE_PATH: bootstrap.sqlite_path,
+      };
+      await patchContainerEnvironment(
+        args.apiUrl,
+        args.token,
+        containerId,
+        startupEnvironment
+      );
+      const startupCommand =
+        args.startupCommand.length > 0
+          ? args.startupCommand
+          : [
+              'python3',
+              '/workspace/amp/quilt_amp.py',
+              'shell',
+              '--addr',
+              DEFAULT_AMP_LISTEN_ADDR,
+              '--no-launch',
+              '--http-url',
+              service.public_url,
+              '--websocket-url',
+              service.websocket_url,
+              '--service-id',
+              service.service_id,
+              '--bootstrap-agent',
+              bootstrapCanonicalAgent,
+              '--bootstrap-token',
+              bootstrapToken,
+            ];
+      startupInput = startupInputWithEnv(startupCommand, startupEnvironment);
+    }
     process.stderr.write(
       `[quilt-nightly] container running; launching ${profile.displayName} TUI...\n`
     );
@@ -719,7 +1315,7 @@ async function runProfileFlow(args) {
     const cols = Number.isFinite(args.cols) && args.cols > 0 ? args.cols : size.cols;
     const rows = Number.isFinite(args.rows) && args.rows > 0 ? args.rows : size.rows;
     process.stderr.write(
-      `[quilt-nightly] opening terminal session (container=${containerIdentifier}, shell=${args.toolPath})\n`
+      `[quilt-nightly] opening terminal session (container=${containerId}, shell=${args.toolPath})\n`
     );
     process.stderr.write(
       `[quilt-nightly] terminal attach can take up to ~${Math.ceil(args.startTimeoutMs / 1000)} seconds\n`
@@ -728,10 +1324,102 @@ async function runProfileFlow(args) {
     const exitCode = await attachTool({
       apiUrl: args.apiUrl,
       token: args.token,
-      containerId: containerIdentifier,
+      containerId,
       cols,
       rows,
       toolPath: args.toolPath,
+      startupInput,
+    });
+
+    await maybeCleanup();
+    process.exitCode = typeof exitCode === 'number' ? exitCode : 0;
+  } catch (err) {
+    /** @type {NightlyError} */
+    const nightlyErr = /** @type {NightlyError} */ (err);
+    if (nightlyErr?.status || nightlyErr?.requestId || nightlyErr?.code) {
+      process.stderr.write(
+        `[quilt-nightly] operation failed (status=${nightlyErr.status || 'unknown'}, code=${nightlyErr.code || 'ERROR'}, request_id=${nightlyErr.requestId || 'unknown'}): ${nightlyErr.backendMessage || nightlyErr.message}\n`
+      );
+      nightlyErr.quiltNightlyLogged = true;
+    }
+    throw nightlyErr;
+  } finally {
+    process.off('SIGINT', sigHandler);
+    process.off('SIGTERM', sigHandler);
+  }
+}
+
+async function runAegisSwarmFlow(args, baseName, startupInput) {
+  const leaderName = `${baseName}-0`;
+  const containerIds = [];
+  let cleaned = false;
+
+  const maybeCleanup = async () => {
+    if (cleaned) return;
+    cleaned = true;
+    if (args.cleanup && !args.keep) {
+      await Promise.all(
+        containerIds.map((containerId) => deleteContainer(args.apiUrl, args.token, containerId))
+      );
+    }
+  };
+
+  const sigHandler = async () => {
+    await maybeCleanup();
+    process.exit(130);
+  };
+
+  process.on('SIGINT', sigHandler);
+  process.on('SIGTERM', sigHandler);
+
+  try {
+    for (let index = 0; index < args.swarmCount; index += 1) {
+      const name = `${baseName}-${index}`;
+      const containerId = await createManagedContainer(args, name, profileDefaultContainerCommand(args));
+      containerIds.push(containerId);
+      await waitForRunning(args.apiUrl, args.token, containerId, args.startTimeoutMs);
+      await waitForContainerReady(args.apiUrl, args.token, containerId, args.startTimeoutMs, true);
+      await syncArchiveToContainer(
+        args.apiUrl,
+        args.token,
+        containerId,
+        process.cwd(),
+        args.startTimeoutMs
+      );
+      if (index > 0) {
+        const workerExec = await execInContainer(
+          args.apiUrl,
+          args.token,
+          containerId,
+          ['/bin/sh', '-lc', aegisWorkerStartupCommand(index)],
+          '/workspace'
+        );
+        if (workerExec?.exit_code !== 0) {
+          throw new Error(
+            `failed to start Aegis swarm worker ${index}: ${workerExec?.stderr || workerExec?.stdout || 'unknown error'}`
+          );
+        }
+      }
+    }
+
+    const guiUrl = await getGuiUrl(args.apiUrl, args.token, containerIds[0]);
+    if (guiUrl) {
+      process.stderr.write(`[quilt-nightly] Aegis leader GUI URL: ${guiUrl}\n`);
+    }
+    process.stderr.write(
+      `[quilt-nightly] Aegis swarm ready (${args.swarmCount} containers); attaching to leader ${leaderName}\n`
+    );
+    const size = terminalSize();
+    const cols = Number.isFinite(args.cols) && args.cols > 0 ? args.cols : size.cols;
+    const rows = Number.isFinite(args.rows) && args.rows > 0 ? args.rows : size.rows;
+    const exitCode = await attachTool({
+      apiUrl: args.apiUrl,
+      token: args.token,
+      containerId: containerIds[0],
+      cols,
+      rows,
+      toolPath: args.toolPath,
+      startupInput,
     });
 
     await maybeCleanup();

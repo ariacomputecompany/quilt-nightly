@@ -7,3 +7,7 @@ npm-debug.log*
 !.env.example
 dist/
 *.tgz
+__pycache__/
+*.pyc
+.fozzy/
+.quilt/
