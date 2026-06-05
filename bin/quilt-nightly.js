@@ -71,6 +71,8 @@ const PROFILES = [PROFILE_CC, PROFILE_CODEX, PROFILE_RLM, PROFILE_AEGIS, PROFILE
  * @property {string} path
  * @property {string | null} token
  * @property {unknown} [body]
+ * @property {Buffer | string} [rawBody]
+ * @property {Record<string, string>} [headers]
  */
 
 /**
@@ -425,10 +427,17 @@ async function apiRequest({ method, apiUrl, path: apiPath, token, body, rawBody,
   if (rawBody === undefined && body !== undefined && !requestHeaders['Content-Type']) {
     requestHeaders['Content-Type'] = 'application/json';
   }
+  /** @type {BodyInit | undefined} */
+  const requestBody =
+    rawBody !== undefined
+      ? /** @type {BodyInit} */ (rawBody)
+      : body !== undefined
+        ? JSON.stringify(body)
+        : undefined;
   const res = await fetch(`${apiUrl.replace(/\/$/, '')}${apiPath}`, {
     method,
     headers: requestHeaders,
-    body: rawBody !== undefined ? rawBody : body !== undefined ? JSON.stringify(body) : undefined,
+    body: requestBody,
   });
 
   const text = await res.text();
